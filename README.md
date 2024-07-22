@@ -17,6 +17,8 @@ The code follows as:
 10. Figure_1_gh
 11. FigureS4_gh
 
+Additionally this repository contains the appendixes of the stan models and the simulations used in this paper.
+
 Colonies have been renamed as colony 1, 2 and 3. Original names are
 - La Gruta = colony 1
 - Aj cave = colony 2
