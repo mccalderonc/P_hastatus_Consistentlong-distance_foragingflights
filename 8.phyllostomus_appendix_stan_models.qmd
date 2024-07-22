@@ -1,0 +1,1890 @@
+---
+title: "Appendix: Consistent long-distance foraging flights across years and seasons at colony level in a Neotropical bat"
+date: today
+format: 
+  html:
+    table-of-contents: true
+    code-fold: true
+    embed-resources: true
+---
+
+# Note
+
+This document contains the analysis of observed and simulated foraging locations using generalised linear mixed-effects models. The models were  implemented in STAN and can be found in the respective folder. The document also contains the code written to compute contrasts, and visualise the model and results. 
+
+# Session set-up
+```{r}
+#| label: setup
+#| code-summary: Setup
+#| message: false
+#| warning: false
+# Load packages
+library(tidyverse)
+library(cmdstanr)
+library(tidybayes)
+library(ggdist)
+library(patchwork)
+library(geosphere)
+library(terra)
+library(sf)
+library(tidyterra)
+library(ggspatial)
+library(viridisLite)
+library(cowplot)
+
+set_cmdstan_path('C:/.cmdstan/cmdstan-2.34.1/')
+
+# Load additional functions
+file_list <- list.files(
+  path = "R", pattern = "\\.R$", recursive = TRUE, full.names = TRUE
+)
+for (file in file_list) { source(file) }
+
+# Set seed
+seed <- 6345789
+set.seed(seed)
+
+# Stan options
+options(mc.cores = parallel::detectCores() - 1)
+
+# Colors
+orange <- "#f98b06"
+orange_light <- "#f6be09"
+orange_dark <- "#e97516"
+blue <- "#0674F9"
+blue_light <- "#06EDF9"
+blue_dark <- "#1206F9"
+
+# Set plot theme
+theme_set(theme_vintage())
+
+```
+# Data import and preparation
+```{r}
+#| label: load-data
+#| code-summary: Load data
+#| message: false
+load("data/240502_foraging_all.RData")
+
+angle_rad <- as_tibble(foraging) |>
+  filter(location != "isla colon") |>
+  rename(angle_rad = angle.rad) |>
+  mutate(angle_rad = angle_rad * (360/pi) * pi/180 - pi) |>
+  mutate(dist = sq.dist^2) |>
+  mutate(movement = matrix(c(dist, angle_rad), ncol = 2))
+
+caves <- function(.data) {
+  .data |>
+    select(individual, cave) |>
+    distinct() |>
+    mutate(
+      ind = as.factor(individual) |> as.integer(),
+      cave = as.factor(cave) |> as.integer()
+    ) |>
+    arrange(individual) |>
+    pull(cave)
+}
+
+obs_wet <- angle_rad |>
+  filter(season == "wet", type == "observed")
+
+sim_wet <- angle_rad |>
+  filter(season == "wet", type == "simulated")
+
+obs_dry <- angle_rad |>
+  filter(season == "dry", type == "observed")
+
+sim_dry <- angle_rad |>
+  filter(season == "dry", type == "simulated")
+
+```
+
+# Multivariate models
+
+To estimate the agreement between the simulation model and the observed data, we fit a linear model of angles and distances with individual as a random effect and weakly regularizing priors. We fit the model separately for each cave in the wet and dry seasons for observed and simulated data.
+
+The model for distance is
+$$
+\begin{align*}
+  \text{distance}_{i} &\sim \text{Normal}(\mu_{\text{distance}[i]}, \sigma) \\
+  \mu_i &\sim \text{Normal}(M_{\text{distance}}, \tau) \\
+  M_{\text{distance}} &\sim \text{Normal}(0, 5) \\
+  \sigma &\sim \text{Exponential}(1) \\
+  \tau &\sim \text{Exponential}(0.5),
+\end{align*}
+$$
+where $\text{distance}_{i}$ is the distance of the $i$th observation, $\mu_i$ is the mean distance of the $i$th observation, $M$ is the mean distance of all observations, $\tau$ is the deviation of the individual mean distances from $M$ (the individual-level variability), and $\sigma$ is the standard deviation of the distances (the observation-level variability).
+
+The model for angle is a normal-approximation, with an identical structure to the distance model,
+$$
+\begin{align*}
+  \text{angle}_{i} &\sim \text{Normal}(\mu_{\text{angle}[i]}, \kappa) \\
+  \mu_{\text{angle}[i]} &\sim \text{Normal}(M_{\text{angle}}, \zeta) \\
+  M_{\text{angle}} &\sim \text{Normal}(0, 1) \\
+  \kappa &\sim \text{Exponential}(1) \\
+  \zeta &\sim \text{Exponential}(0.5).
+\end{align*}
+$$
+
+We focus on the population means $M$ and the effective standard deviations $\sqrt{\tau^2 + \sigma^2}$, which captures the overall variability, for each cave and season, and compute the contrasts between the observed and simulated data to assess the agreement between the two datasets.
+
+## Load STAN models
+```{r}
+#| label: models
+#| code-summary: Compile models
+# Sometimes the noncentered parameterization is faster and more reliable, sometimes the centered one is. I believe it has something to do with the geometry of the posterior distribution and the amount of data. If one parameterization doesn't work, try the other one. The meaning of the parameters is the same in both cases.
+model_noncentered <- cmdstan_model("stan/movement.stan")
+model_centered <- cmdstan_model("stan/movement-centered.stan")
+
+```
+## Fit models for wet season
+
+```{r}
+#| label: wet-season
+#| code-summary: Fit models for the wet season
+#| include: true
+#| warning: false
+#| message: false
+obs_data_sim_wet <- sim_wet |>
+  transmute(movement, ii = individual) %>%
+  compose_data(
+    I = unique(ii) |> length(),
+    cc = caves(sim_wet), C = max(cc),
+    .n_name = n_prefix("N")
+  )
+
+fit_sim_wet <- model_noncentered$sample(
+  data = obs_data_sim_wet,
+  seed = seed,
+  refresh = 0
+)
+
+obs_data_obs_wet <- obs_wet |>
+  transmute(movement, ii = individual) %>%
+  compose_data(
+    I = unique(ii) |> length(),
+    cc = caves(obs_wet), C = max(cc),
+    .n_name = n_prefix("N")
+  )
+
+fit_obs_wet <- model_noncentered$sample(
+  data = obs_data_obs_wet,
+  seed = seed,
+  refresh = 0
+)
+
+```
+
+## Fit models for dry season
+
+```{r}
+#| label: dry-season
+#| code-summary: Fit models for the dry season
+#| include: true
+#| warning: false
+#| message: false
+obs_data_sim_dry <- sim_dry |>
+  transmute(movement, ii = individual) %>%
+  compose_data(
+    I = unique(ii) |> length(),
+    cc = caves(sim_dry), C = max(cc),
+    .n_name = n_prefix("N")
+  )
+
+fit_sim_dry <- model_noncentered$sample(
+  data = obs_data_sim_dry,
+  seed = seed,
+  refresh = 0
+)
+
+obs_data_obs_dry <- obs_dry |>
+  transmute(movement, ii = individual) %>%
+  compose_data(
+    I = unique(ii) |> length(),
+    cc = caves(obs_dry), C = max(cc),
+    .n_name = n_prefix("N")
+  )
+
+fit_obs_dry <- model_noncentered$sample(
+  data = obs_data_obs_dry,
+  seed = seed,
+  refresh = 0
+)
+
+```
+
+# Extract model estimates for observed foraging locations
+
+Mean estimates and 95% credibility interval (qi) from the model for observed foraging locations. 
+
+## Get estimates for wet & dry season
+
+```{r}
+#| label: cave-params-obs
+#| code-summary: Cave parameters in the wet season
+
+#################################################
+# Wet season parameters
+est.obs.wet <- fit_obs_wet |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(cave = if_else(c == 1, "ajcave", "lagruta")) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+est.obs.wet$season <- 'wet'
+
+#################################################
+# Dry season parameters
+est.obs.dry <- fit_obs_dry |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta",
+      c == 3 ~ "muddycave"
+    )
+  ) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+est.obs.dry$season <- 'dry'
+
+#################################################
+## combine
+
+est.obs <- rbind(est.obs.wet, est.obs.dry)
+est.obs$cave <- gsub('.*_', '', est.obs$measurement)
+est.obs$par <- unlist(lapply(strsplit(est.obs$measurement, '_'), function(x){paste(x[-length(x)], collapse='_')}))
+
+est.obs$season <- factor(est.obs$season, labels=c('dry season', 'wet season'))
+
+est.obs$cave <- ifelse(est.obs$cave=='lagruta', 'colony 1', ifelse(est.obs$cave=='ajcave', 'colony 2', 'colony 3'))
+# est.obs$cave <- factor(est.obs$cave, levels=c('ajcave', 'lagruta', 'muddycave'), labels=paste('cave', c(2,3,1)))
+
+```
+
+## Tables
+
+```{r}
+#| echo: false
+#| tbl-cap: "Parameter estimates for distance model."
+
+copy <- est.obs
+copy$range <- paste0('[', paste(round(copy$.lower,2), round(copy$.upper,2), sep= ' - '), ']')
+copy <- copy[with(copy, order(season, cave)),]
+
+knitr:::kable(copy[grepl('M_dist', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Population mean (km)', digits=2)
+
+knitr:::kable(copy[grepl('effective_sigma', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Effective standard deviation (km)', digits=2)
+
+knitr:::kable(copy[grepl('tau_dist', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Individual-level variability (km)', digits=2)
+
+
+```
+```{r}
+#| echo: false
+#| tbl-cap: "Parameter estimates for angle model."
+
+knitr:::kable(copy[grepl('M_angle', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Population mean (rad)', digits=2)
+
+knitr:::kable(copy[grepl('effective_kappa', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Effective standard deviation (rad)', digits=2)
+
+knitr:::kable(copy[grepl('zeta_angle', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Individual-level variability (rad)', digits=2)
+
+
+
+```
+
+## Figure
+
+```{r}
+#| echo: false
+#| warning: false
+#| fig-caption: Mean and 95% qi for model estimates on population mean M, effective standard deviation, and individual-level variability for distance (upper row) and angle(lower row). Wet season is shown in light grey, dry season in dark grey. 
+
+copy$model <- ifelse(grepl('angle', copy$par), 'Angle', 'Distance')
+copy$type <- ifelse(grepl('effective', copy$par), 'Effective standard deviation',
+                    ifelse(grepl('M_', copy$par), 'Population mean',
+                           ifelse(grepl('zeta', copy$par)|grepl('tau', copy$par), 'Individual-level variability', 'other')))
+copy$type <- factor(copy$type, levels=c('Population mean', 'Effective standard deviation', 'Individual-level variability', 'other'))
+
+dist <- ggplot(copy[copy$type!='other' & copy$model=='Distance',], aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2), show.legend=F) +
+  scale_colour_grey(name='', start=0.3, end=0.7) +
+  facet_wrap(~type, scales='free_x') +
+  scale_y_discrete(limits=rev) +
+  labs(y='Distance model') +
+  theme_light() + 
+  theme(strip.background=element_rect(fill='white', colour='black'), 
+        strip.text=element_text(colour='black'),
+        axis.title.x=element_blank())
+
+angle <- ggplot(copy[copy$type!='other' & copy$model=='Angle',], aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2), show.legend=F) +
+  scale_colour_grey(name='', start=0.3, end=0.7) +
+  facet_wrap(~type) +
+  scale_y_discrete(limits=rev) +
+  labs(x='Model estimate', y='Angle model') +
+  theme_light() + 
+  theme(strip.background=element_blank(), 
+        strip.text=element_blank())
+
+dist + angle + plot_layout(ncol=1)
+
+ggsave(filename='240625_model_estimates_obs.png', width=170, height=110, unit='mm')
+  
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| eval: false
+#| fig-caption: Mean and 95% qi for (1) population mean of the distance to foraging locations (M_dist), (2) effective standard deviation (effective_sigma_dist), and (3) the deviation of individuals from the population mean, (tau_dist).
+
+ggplot(est.obs[est.obs$par=='M_dist_uncentered',], 
+       aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  labs(x=expression('M'[distance]*~'(km)'),
+       title='Mean distance of the population') +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+ggplot(est.obs[est.obs$par=='effective_sigma_dist',], 
+       aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  labs(x=expression(sigma[eff]*~'(km)'), 
+       title='Effective standard deviation from mean distance') +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+ggplot(est.obs[est.obs$par=='tau_dist',], 
+       aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  labs(x=expression(~tau[distance]*~'(km)'), 
+       title='Deviation of individuals from mean distance') +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+```
+
+# Spatial representation of estimated distributions
+
+Above figures are not particularly indicative of the overlap between foraging sites of bat caves, but rather show whether the angle and distance *relative to the respective cave* are similar between the different caves. If we want to visualise overlap in where bats forage we need to make the estimates from the model spatially explicit.
+Here, I will compute two rasters for each cave and season (one for the distance distribution, one for the angle distribution), and multiply them with each other to get the 2D-distribution of the estimated population mean for foraging locations. Note: the values of this are not the absolute, but rather think of it as the relative probability.
+These we can overlay a figure to visualise the overlap between caves in each season, and within caves between seasons. 
+
+Computations take some time, which is why I have run them previously so we can just import the resulting rasters. This is what the model results look like on a map (colour scheme is the same as for your figure 1):
+
+
+## Compute rasters with PDFs for distance and angle distributions
+```{r}
+#| eval: false
+
+
+cave.loc <- data.frame(
+  cave=c('lagruta', 'ajcave', 'muddycave'),
+  long=c(-82.271541, -82.274955, -82.264753),
+  lat=c(9.396448, 9.440312, 9.387233)
+)
+
+m <- rast('C:/Users/mavaaa/Dropbox/work/projects/phyllostomus/output/d2coast_100m.tif')
+m <- m==0
+m <- crop(m, ext(310000, 410000, 988000, 1099000))
+
+cave.loc <- st_as_sf(cave.loc, coords=c('long', 'lat'), crs=st_crs('+proj=longlat +datum=WGS84'))
+cave.loc <- st_transform(cave.loc, crs=st_crs(m))
+
+# determine angle & distance to each cell to calculate probability
+co <- as.data.frame(crds(m))
+# co <- st_as_sf(co, coords=c('x', 'y'), crs=st_crs(m))
+
+#################################################
+## la gruta, dry
+
+d1 <- unlist(lapply(1:nrow(co), function(j){co[j,1]-st_coordinates(cave.loc[cave.loc$cave=='lagruta',])[,1]}))
+d2 <- unlist(lapply(1:nrow(co), function(j){co[j,2]-st_coordinates(cave.loc[cave.loc$cave=='lagruta',])[,2]}))
+co$angle.lagruta <- (atan(d1/d2) + 2*pi)%%pi
+co$angle.lagruta[d1<0] <- co$angle.lagruta[d1<0] + pi
+co$p.angle <- dnorm(co$angle.lagruta, 
+                   mean=est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='M_angle_uncentered' & est.obs$season=='dry season']+pi,
+                   sd=est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='effective_kappa_angle' & est.obs$season=='dry season'])
+
+angle.lagruta <- m; values(angle.lagruta) <- co$p.angle
+
+co$distance.lagruta <- values(distance(m, cave.loc[cave.loc$cave=='lagruta',]))/1000
+co$p.dist <- dnorm(co$distance.lagruta, 
+                   mean=(est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='M_dist_uncentered' & est.obs$season=='dry season']),
+                   sd=est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='effective_sigma_dist' & est.obs$season=='dry season'])
+distance.lagruta <- m; values(distance.lagruta) <- co$p.dist
+
+both.lagruta.dry <- distance.lagruta * angle.lagruta
+rm(list=c('distance.lagruta', 'angle.lagruta', 'd1', 'd2')); gc()
+
+#################################################
+## aj cave, dry
+
+d1 <- unlist(lapply(1:nrow(co), function(j){co[j,1]-st_coordinates(cave.loc[cave.loc$cave=='ajcave',])[,1]}))
+d2 <- unlist(lapply(1:nrow(co), function(j){co[j,2]-st_coordinates(cave.loc[cave.loc$cave=='ajcave',])[,2]}))
+co$angle.ajcave <- (atan(d1/d2) + 2*pi)%%pi
+co$angle.ajcave[d1<0] <- co$angle.ajcave[d1<0] + pi
+co$p.angle <- dnorm(co$angle.ajcave, 
+                   mean=est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='M_angle_uncentered' & est.obs$season=='dry season']+pi,
+                   sd=est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='effective_kappa_angle' & est.obs$season=='dry season'])
+
+angle.ajcave <- m; values(angle.ajcave) <- co$p.angle
+
+co$distance.ajcave <- values(distance(m, cave.loc[cave.loc$cave=='ajcave',]))/1000
+co$p.dist <- dnorm(co$distance.ajcave, 
+                   mean=(est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='M_dist_uncentered' & est.obs$season=='dry season']),
+                   sd=est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='effective_sigma_dist' & est.obs$season=='dry season'])
+distance.ajcave <- m; values(distance.ajcave) <- co$p.dist
+
+both.ajcave.dry <- distance.ajcave * angle.ajcave
+rm(list=c('distance.ajcave', 'angle.ajcave', 'd1', 'd2')); gc()
+
+#################################################
+## muddy cave, dry
+
+d1 <- unlist(lapply(1:nrow(co), function(j){co[j,1]-st_coordinates(cave.loc[cave.loc$cave=='muddycave',])[,1]}))
+d2 <- unlist(lapply(1:nrow(co), function(j){co[j,2]-st_coordinates(cave.loc[cave.loc$cave=='muddycave',])[,2]}))
+co$angle.muddycave <- (atan(d1/d2) + 2*pi)%%pi
+co$angle.muddycave[d1<0] <- co$angle.muddycave[d1<0] + pi
+co$p.angle <- dnorm(co$angle.muddycave, 
+                   mean=est.obs$value[est.obs$cave=='cave 3' & est.obs$par=='M_angle_uncentered' & est.obs$season=='dry season']+pi,
+                   sd=est.obs$value[est.obs$cave=='cave 3' & est.obs$par=='effective_kappa_angle' & est.obs$season=='dry season'])
+
+angle.muddycave <- m; values(angle.muddycave) <- co$p.angle
+
+co$distance.muddycave <- values(distance(m, cave.loc[cave.loc$cave=='muddycave',]))/1000
+co$p.dist <- dnorm(co$distance.muddycave, 
+                   mean=(est.obs$value[est.obs$cave=='cave 3' & est.obs$par=='M_dist_uncentered' & est.obs$season=='dry season']),
+                   sd=est.obs$value[est.obs$cave=='cave 3' & est.obs$par=='effective_sigma_dist' & est.obs$season=='dry season'])
+distance.muddycave <- m; values(distance.muddycave) <- co$p.dist
+
+both.muddycave.dry <- distance.muddycave * angle.muddycave
+rm(list=c('distance.muddycave', 'angle.muddycave', 'd1', 'd2')); gc()
+
+
+#################################################
+## la gruta, wet
+
+d1 <- unlist(lapply(1:nrow(co), function(j){co[j,1]-st_coordinates(cave.loc[cave.loc$cave=='lagruta',])[,1]}))
+d2 <- unlist(lapply(1:nrow(co), function(j){co[j,2]-st_coordinates(cave.loc[cave.loc$cave=='lagruta',])[,2]}))
+co$angle.lagruta <- (atan(d1/d2) + 2*pi)%%pi
+co$angle.lagruta[d1<0] <- co$angle.lagruta[d1<0] + pi
+co$p.angle <- dnorm(co$angle.lagruta, 
+                   mean=est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='M_angle_uncentered' & est.obs$season=='wet season']+pi,
+                   sd=est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='effective_kappa_angle' & est.obs$season=='wet season'])
+
+angle.lagruta <- m; values(angle.lagruta) <- co$p.angle
+
+co$distance.lagruta <- values(distance(m, cave.loc[cave.loc$cave=='lagruta',]))/1000
+co$p.dist <- dnorm(co$distance.lagruta, 
+                   mean=(est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='M_dist_uncentered' & est.obs$season=='wet season']),
+                   sd=est.obs$value[est.obs$cave=='cave 1' & est.obs$par=='effective_sigma_dist' & est.obs$season=='wet season'])
+distance.lagruta <- m; values(distance.lagruta) <- co$p.dist
+
+both.lagruta.wet <- distance.lagruta * angle.lagruta
+rm(list=c('distance.lagruta', 'angle.lagruta', 'd1', 'd2')); gc()
+
+#################################################
+## aj cave, wet
+
+d1 <- unlist(lapply(1:nrow(co), function(j){co[j,1]-st_coordinates(cave.loc[cave.loc$cave=='ajcave',])[,1]}))
+d2 <- unlist(lapply(1:nrow(co), function(j){co[j,2]-st_coordinates(cave.loc[cave.loc$cave=='ajcave',])[,2]}))
+co$angle.ajcave <- (atan(d1/d2) + 2*pi)%%pi
+co$angle.ajcave[d1<0] <- co$angle.ajcave[d1<0] + pi
+co$p.angle <- dnorm(co$angle.ajcave, 
+                   mean=est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='M_angle_uncentered' & est.obs$season=='wet season']+pi,
+                   sd=est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='effective_kappa_angle' & est.obs$season=='wet season'])
+
+angle.ajcave <- m; values(angle.ajcave) <- co$p.angle
+
+co$distance.ajcave <- values(distance(m, cave.loc[cave.loc$cave=='ajcave',]))/1000
+co$p.dist <- dnorm(co$distance.ajcave, 
+                   mean=(est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='M_dist_uncentered' & est.obs$season=='wet season']),
+                   sd=est.obs$value[est.obs$cave=='cave 2' & est.obs$par=='effective_sigma_dist' & est.obs$season=='wet season'])
+distance.ajcave <- m; values(distance.ajcave) <- co$p.dist
+
+both.ajcave.wet <- distance.ajcave * angle.ajcave
+rm(list=c('distance.ajcave', 'angle.ajcave', 'd1', 'd2')); gc()
+
+all <- rast(list(both.ajcave.dry, both.lagruta.dry, both.muddycave.dry,
+                 both.ajcave.wet, both.lagruta.wet))
+names(all) <- c('ajcave.dry', 'lagruta.dry', 'muddycave.dry',
+           'ajcave.wet', 'lagruta.wet')
+
+writeRaster(all, filenam='spatial_2D_pred.tif', overwrite=T)
+
+```
+
+## Figure
+```{r}
+#| warning: false
+
+
+points.dry <- st_as_sf(foraging[foraging$type=='observed' & !foraging$colon & foraging$season=='dry',], coords=c('long', 'lat'), crs=st_crs('+proj=longlat +datum=WGS84'))
+points.wet <- st_as_sf(foraging[foraging$type=='observed' & !foraging$colon & foraging$season=='wet',], coords=c('long', 'lat'), crs=st_crs('+proj=longlat +datum=WGS84'))
+
+proj.ll <- '+proj=longlat +datum=WGS84'
+proj.utm <- '+proj=utm +zone=17 +ellps=GRS80 +units=m +no_defs +type=crs'
+
+adm <- rbind(st_read('C:/Users/mavaaa/Dropbox/work/projects/phyllostomus/data/environmental/gadm41_PAN_shp/gadm41_PAN_0.shp', quiet=T),
+             st_read('C:/Users/mavaaa/Dropbox/work/projects/phyllostomus/data/environmental/gadm41_CRI_shp/gadm41_CRI_0.shp', quiet=T))
+coastline <- st_union(adm)
+coastline <- st_transform(coastline, st_crs(proj.utm))
+
+rank.rast <- function(dist){
+  dist <- dist/sum(values(dist))
+  rank <- (1:length(values(dist)))[rank(values(dist))]
+  values(dist) <- 1 - cumsum(sort(values(dist)))[rank]
+  return(dist)
+}
+
+tmp <- rast('spatial_2D_pred.tif', lyrs='lagruta.dry')
+tmp2 <- mask(tmp, vect(coastline))
+c1.dry <- tmp2/max(values(tmp2), na.rm=T)
+c1.dry <- mask(c1.dry, rank.rast(tmp)<0.95, maskvalues=0)
+
+tmp <- rast('spatial_2D_pred.tif', lyrs='ajcave.dry')
+tmp2 <- mask(tmp, vect(coastline))
+c2.dry <- tmp2/max(values(tmp2), na.rm=T)
+c2.dry <- mask(c2.dry, rank.rast(tmp)<0.95, maskvalues=0)
+
+tmp <- rast('spatial_2D_pred.tif', lyrs='muddycave.dry')
+tmp2 <- mask(tmp, vect(coastline))
+c3.dry <- tmp2/max(values(tmp2), na.rm=T)
+c3.dry <- mask(c3.dry, rank.rast(tmp)<0.95, maskvalues=0)
+
+map.dry <- ggplot(coastline) +
+  geom_sf(fill='white', colour='grey10', linewidth=0.2) +
+  # geom_sf(data=st_graticule(st_transform(coastline, st_crs(proj.utm)), lon = seq(-83,81,0.2), lat=seq(8,10,0.2)), colour='#22211d', linewidth=0.05) +
+  geom_spatraster(data=c1.dry, fill='#21807b', aes(alpha=after_stat(value))) +
+  geom_spatraster(data=c2.dry, fill='#5d236b', aes(alpha=after_stat(value))) +
+  geom_spatraster(data=c3.dry, fill='#fde725', aes(alpha=after_stat(value))) +
+  geom_sf(data=points.dry[points.dry$cave=='lagruta',], colour='#21807b', size=0.5) +
+  geom_sf(data=points.dry[points.dry$cave=='ajcave',], colour='#5d236b', size=0.5) +
+  geom_sf(data=points.dry[points.dry$cave=='muddycave',], colour='#fde725', size=0.5) +
+  scale_alpha_binned(na.value=0, range=c(0.1, 0.95)) +
+  scale_x_continuous(expand=c(0,0), limits=ext(c1.dry)[c(1,2)] + c(15000,-40000), breaks=seq(-82.6, -82.2, .1)) +
+  scale_y_continuous(expand=c(0,0), limits=ext(c1.dry)[c(3,4)] + c(22500,-42500), breaks=seq(9.2,9.5,.1)) +
+  geom_text(aes(x=375000, y=1063500, label='Dry season')) +
+  theme_light() + theme(panel.background=element_rect(fill='#d9d9d9')) +
+  guides(alpha=guide_none()) +
+  annotation_scale(location = "bl", line_width = 1) +
+  # scalebar(location = "bottomleft", x.min=as.vector(ext(c1.dry))[1]+10000, x.max=as.vector(ext(c1.dry))[2]-20000, y.min=as.vector(ext(c1.dry))[3]+15000, y.max=as.vector(ext(c1.dry))[4]-30000, dist = 10, transform=FALSE, dist_unit = "km") + #, nudge_y= -0.01)
+  labs(x='Longitude', y='Latitude')
+  
+tmp <- rast('spatial_2D_pred.tif', lyrs='lagruta.wet')
+tmp2 <- mask(tmp, vect(coastline))
+c1.wet <- tmp2/max(values(tmp2), na.rm=T)
+c1.wet <- mask(c1.wet, rank.rast(tmp)<0.95, maskvalues=0)
+
+tmp <- rast('spatial_2D_pred.tif', lyrs='ajcave.wet')
+tmp2 <- mask(tmp, vect(coastline))
+c2.wet <- tmp2/max(values(tmp2), na.rm=T)
+c2.wet <- mask(c2.wet, rank.rast(tmp)<0.95, maskvalues=0)
+
+map.wet <- ggplot(st_transform(coastline, st_crs(proj.utm))) +
+  geom_sf(fill='white', colour='grey10', linewidth=0.2) +
+  # geom_sf(data=st_graticule(st_transform(coastline, st_crs(proj.utm)), lon = seq(-83,81,0.2), lat=seq(8,10,0.2)), colour='#22211d', linewidth=0.05) +
+  geom_spatraster(data=c1.wet, fill='#5ec962', aes(alpha=after_stat(value))) +
+  geom_spatraster(data=c2.wet, fill='#3b528b', aes(alpha=after_stat(value))) +
+    geom_sf(data=points.wet[points.wet$cave=='lagruta',], colour='#5ec962', size=0.5) +
+  geom_sf(data=points.wet[points.wet$cave=='ajcave',], colour='#3b528b', size=0.5) +
+  scale_alpha_binned(na.value=0, range=c(0.1, 0.95)) +
+  scale_x_continuous(expand=c(0,0), limits=ext(c1.dry)[c(1,2)] + c(15000,-40000), breaks=seq(-82.6, -82.2, .1)) +
+  scale_y_continuous(expand=c(0,0), limits=ext(c1.dry)[c(3,4)] + c(22500,-42500), breaks=seq(9.2,9.5,.1)) +
+  # scale_x_continuous(expand=c(0,0), limits=ext(c1.dry)[c(1,2)] + c(10000,-20000), breaks=c(-82.6, -82.4, -82.2)) +
+  # scale_y_continuous(expand=c(0,0), limits=ext(c1.dry)[c(3,4)] + c(15000,-30000)) +
+  theme_light() + theme(axis.title.y=element_blank(), 
+                        axis.ticks.y=element_blank(), 
+                        axis.text.y=element_blank(), 
+                        panel.background=element_rect(fill='#d9d9d9')) +
+  guides(alpha=guide_none()) +
+  geom_text(aes(x=375000, y=1063500, label='Wet season')) +
+  annotation_scale(location = "bl", line_width = 1) +
+  # scalebar(location = "bottomleft", x.min=as.vector(ext(c1.dry))[1]+10000, x.max=as.vector(ext(c1.dry))[2]-20000, y.min=as.vector(ext(c1.dry))[3]+15000, y.max=as.vector(ext(c1.dry))[4]-30000, dist = 10, height = 0.2, transform=FALSE, model = "WGS84", dist_unit = "km") + #, nudge_y= -0.01)
+  labs(x='Longitude')
+
+map.dry + map.wet + plot_layout(ncol=2)
+
+ggsave(filename='240716_comparison_spatial.png', width=170, height=90, unit='mm')
+
+```
+
+## Spatial overlap between colonies during dry season
+
+```{r}
+#| warning: false
+
+c1.poly <- st_as_sf(as.polygons(c1.dry>0))
+c2.poly <- st_as_sf(as.polygons(c2.dry>0))
+c3.poly <- st_as_sf(as.polygons(c3.dry>0))
+
+print(paste('overlap colony 1 with colony 2, in %:', round(st_area(st_intersection(c2.poly, c1.poly))/st_area(c2.poly) * 100, 2)))
+print(paste('overlap colony 2 with colony 1, in %:', round(st_area(st_intersection(c1.poly, c2.poly))/st_area(c1.poly) * 100, 2)))
+print(paste('overlap colony 1 with colony 3, in %:', round(st_area(st_intersection(c1.poly, c3.poly))/st_area(c1.poly) * 100, 2), '0 (no intersection)'))
+print(paste('overlap colony 3 with colony 1, in %:', round(st_area(st_intersection(c3.poly, c1.poly))/st_area(c1.poly) * 100, 2), '0 (no intersection)'))
+print(paste('overlap colony 2 with colony 3, in %:', round(st_area(st_intersection(c2.poly, c3.poly))/st_area(c1.poly) * 100, 2), '0 (no intersection)'))
+print(paste('overlap colony 3 with colony 2, in %:', round(st_area(st_intersection(c3.poly, c2.poly))/st_area(c1.poly) * 100, 2), '0 (no intersection)'))
+
+```
+
+# Model estimates for simulated foraging locations
+
+## Get model estimates
+```{r}
+#| label: cave-params-sim
+#| code-summary: Cave parameters in the wet season
+# Parameters
+est.sim.wet <- fit_sim_wet |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(cave = if_else(c == 1, "ajcave", "lagruta")) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+est.sim.wet$season <- 'wet'
+
+# Parameters
+est.sim.dry <- fit_sim_dry |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta",
+      c == 3 ~ "muddycave"
+    )
+  ) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+est.sim.dry$season <- 'dry'
+
+#################################################
+## combine 
+
+est.sim <- rbind(est.sim.wet, est.sim.dry)
+est.sim$cave <- gsub('.*_', '', est.sim$measurement)
+est.sim$par <- unlist(lapply(strsplit(est.sim$measurement, '_'), function(x){paste(x[-length(x)], collapse='_')}))
+
+est.sim$season <- factor(est.sim$season, labels=c('dry season', 'wet season'))
+
+est.sim$cave <- ifelse(est.sim$cave=='lagruta', 'colony 1', ifelse(est.sim$cave=='ajcave', 'colony 2', 'colony 3'))
+
+```
+
+## Tables
+```{r}
+#| echo: false
+#| tbl-cap: "Parameter estimates for distance model (simulaions)."
+
+copy <- est.sim
+copy$range <- paste0('[', paste(round(copy$.lower,2), round(copy$.upper,2), sep= ' - '), ']')
+copy <- copy[with(copy, order(season, cave)),]
+
+knitr:::kable(copy[grepl('M_dist', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Population mean (km)', digits=2)
+
+knitr:::kable(copy[grepl('effective_sigma', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Effective standard deviation (km)', digits=2)
+
+knitr:::kable(copy[grepl('tau_dist', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Individual-level variability (km)', digits=2)
+
+
+
+```
+```{r}
+#| echo: false
+#| tbl-cap: "Parameter estimates for angle model (simulations)."
+
+knitr:::kable(copy[grepl('M_angle', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Population mean (rad)', digits=2)
+
+knitr:::kable(copy[grepl('effective_kappa', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Effective standard deviation (rad)', digits=2)
+
+knitr:::kable(copy[grepl('zeta_angle', copy$par),c('par', 'season', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Season', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Individual-level variability (rad)', digits=2)
+
+
+
+```
+
+## Figure - estimates for simulations only
+```{r}
+
+copy <- est.sim
+copy$type <- ifelse(grepl('effective', copy$par), 'Effective standard deviation',
+                    ifelse(grepl('M_', copy$par), 'Population mean',
+                           ifelse(grepl('zeta', copy$par)|grepl('tau', copy$par), 'Individual-level variability', 'other')))
+copy$type <- factor(copy$type, levels=c('Population mean', 'Effective standard deviation', 'Individual-level variability', 'other'))
+copy$model <- ifelse(grepl('angle', copy$par), 'Angle', 'Distance')
+
+dist <- ggplot(copy[copy$type!='other' & copy$model=='Distance',], aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2), show.legend=F) +
+  scale_colour_grey(name='', start=0.3, end=0.7) +
+  facet_wrap(~type, scales='free_x') +
+  scale_y_discrete(limits=rev) +
+  labs(y='Distance model') +
+  theme_light() + 
+  theme(strip.background=element_rect(fill='white', colour='black'), 
+        strip.text=element_text(colour='black'),
+        axis.title.x=element_blank())
+
+angle <- ggplot(copy[copy$type!='other' & copy$model=='Angle',], aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=season)) +
+  geom_pointrange(position=position_dodge(width=0.2), show.legend=F) +
+  scale_colour_grey(name='', start=0.3, end=0.7) +
+  facet_wrap(~type) +
+  scale_y_discrete(limits=rev) +
+  labs(x='Model estimate', y='Angle model') +
+  theme_light() + 
+  theme(strip.background=element_blank(), 
+        strip.text=element_blank())
+
+dist + angle + plot_layout(ncol=1)
+
+ggsave(filename='240716_model_estimates_sim.png', width=170, height=110, unit='mm')
+
+
+```
+
+
+## Figure - estimates for observations and simulations
+```{r}
+
+est.obs$class <- 'obs'
+est.sim$class <- 'sim'
+est <- rbind(est.obs, est.sim)
+
+est$type <- ifelse(grepl('effective', est$par), 'Effective standard deviation',
+                    ifelse(grepl('M_', est$par), 'Population mean',
+                           ifelse(grepl('zeta', est$par)|grepl('tau', est$par), 'Individual-level variability', 'other')))
+est$type <- factor(est$type, levels=c('Population mean', 'Effective standard deviation', 'Individual-level variability', 'other'))
+est$model <- ifelse(grepl('angle', est$par), 'Angle', 'Distance')
+
+est$fac <- paste(est$season, est$class, sep=', ')
+
+dist <- ggplot(est[est$type!='other' & est$model=='Distance',], aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=fac, fill=fac)) +
+  geom_hline(data=data.frame(x=c(1.5,2.5)), aes(yintercept=x), linetype=2, colour='grey50') +
+  geom_pointrange(position=position_dodge(width=0.8), show.legend=T, shape=21) +
+  scale_colour_manual(name='', values=c("wet season, obs"="#38AAACFF", "dry season, obs"="#3B2F5EFF", "wet season, sim"='grey60', "dry season, sim"='grey20')) +
+  scale_fill_manual(name='', values=c("wet season, obs"="#38AAACFF", "dry season, obs"="#3B2F5EFF", "wet season, sim"='grey90', "dry season, sim"='grey50')) +
+  facet_wrap(~type, scales='free_x') +
+  scale_y_discrete(limits=rev) +
+  labs(y='Distance model') +
+  theme_light() + 
+  theme(strip.background=element_rect(fill='white', colour='black'), 
+        strip.text=element_text(colour='black'),
+        axis.title.x=element_blank(), legend.position='none')
+
+angle <- ggplot(est[est$type!='other' & est$model=='Angle',], aes(x=value, xmin=.lower, xmax=.upper, y=cave, colour=fac, fill=fac)) +
+  geom_hline(data=data.frame(x=c(1.5,2.5)), aes(yintercept=x), linetype=2, colour='grey50') +
+  geom_pointrange(position=position_dodge(width=0.8), show.legend=T, shape=21) +
+  scale_colour_manual(name='', values=c("wet season, obs"="#38AAACFF", "dry season, obs"="#3B2F5EFF", "wet season, sim"='grey60', "dry season, sim"='grey20')) +
+  scale_fill_manual(name='', values=c("wet season, obs"="#38AAACFF", "dry season, obs"="#3B2F5EFF", "wet season, sim"='grey90', "dry season, sim"='grey50')) +
+  facet_wrap(~type, scales='free_x') +
+  scale_y_discrete(limits=rev) +
+  labs(y='Angle model', x='Model estimate') +
+  theme_light() + 
+  theme(strip.background=element_rect(fill='white', colour='black'), 
+        strip.text=element_text(colour='black'),
+        legend.position='bottom')
+
+dist + angle + plot_layout(ncol=1)
+
+
+ggsave(filename='240716_model_estimates_obs_sim.png', width=170, height=140, unit='mm')
+
+
+```
+
+# Contrasting model estimates between caves and seasons (observed foraging locations)
+
+What we get out of the models are basically distributions, with estimates for the different distribution parameters (e.g. for a normal distribution, that woudl be a mean and standard deviation). 
+The previous figures showed basically the mean and uncertainty around these distributional parameters (apart from the spatial representation, for which we only used main parameters). 
+Given that we have distributions for each metric of interest (e.g. distance to foraging location), we can also calculate the *distribution of differences* between e.g. two caves; so-called contrasts. Effectively, contrasts correspond to the effect size in a frequentist regression model: if you estimate an intercept (say cave 1) and have an estimate for the effect size of cave 2 relative to cave 1, this would be conceptually similar to the contrast between cave 1 and cave 2.
+Contrasts/effect sizes are maybe a bit more convenient than the absolute estimates (as above) to understand whether the differences are biologically meaningful?
+
+## Calculate contrasts between caves, per season
+
+### Get contrasts 
+
+```{r}
+#| label: cave-contrasts-all
+#| code-summary: Contrasting caves in the wet and dry season
+# Contrasts (La Gruta - Aj Cave)
+
+#################################################
+# Contrasts for wet season (as cave A - cave B for each model parameter)
+
+cave.contrast.wet <- fit_obs_wet |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta"
+    )
+  ) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  mutate(
+    diff_M_dist_c1_c2 = M_dist_uncentered_lagruta - M_dist_uncentered_ajcave,
+    diff_sigma_dist_c1_c2 = effective_sigma_dist_lagruta - effective_sigma_dist_ajcave,
+    diff_tau_dist_c1_c2 = tau_dist_lagruta - tau_dist_ajcave,
+    diff_M_angle_c1_c2 = M_angle_uncentered_lagruta - M_angle_uncentered_ajcave,
+    diff_kappa_angle_c1_c2 = effective_kappa_angle_lagruta - effective_kappa_angle_ajcave,
+    diff_zeta_angle_c1_c2 = zeta_angle_lagruta - zeta_angle_ajcave,
+  ) |>
+  select(starts_with(c("diff_"))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+cave.contrast.wet$season <- 'wet'
+
+#################################################
+# Contrasts for dry season (as cave A - cave B for each model parameter)
+
+cave.contrast.dry <- fit_obs_dry |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta",
+      c == 3 ~ "muddycave"
+    )
+  ) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  mutate(
+    diff_M_dist_c1_c2 = M_dist_uncentered_lagruta - M_dist_uncentered_ajcave,
+    diff_M_dist_c1_c3 = M_dist_uncentered_lagruta - M_dist_uncentered_muddycave,
+    diff_M_dist_c2_c3 = M_dist_uncentered_ajcave - M_dist_uncentered_muddycave,
+    diff_sigma_dist_c1_c2 = effective_sigma_dist_lagruta - effective_sigma_dist_ajcave,
+    diff_sigma_dist_c1_c3 = effective_sigma_dist_lagruta - effective_sigma_dist_muddycave,
+    diff_sigma_dist_c2_c3 = effective_sigma_dist_ajcave - effective_sigma_dist_muddycave,
+    diff_tau_dist_c1_c2 = tau_dist_lagruta - tau_dist_ajcave,
+    diff_tau_dist_c1_c2 = tau_dist_lagruta - tau_dist_muddycave,
+    diff_tau_dist_c1_c2 = tau_dist_ajcave - tau_dist_muddycave,
+    diff_M_angle_c1_c2 = M_angle_uncentered_lagruta - M_angle_uncentered_ajcave,
+    diff_M_angle_c1_c3 = M_angle_uncentered_lagruta - M_angle_uncentered_muddycave,
+    diff_M_angle_c2_c3 = M_angle_uncentered_ajcave - M_angle_uncentered_muddycave,
+    diff_kappa_angle_c1_c2 = effective_kappa_angle_lagruta - effective_kappa_angle_ajcave,
+    diff_kappa_angle_c1_c3 = effective_kappa_angle_lagruta - effective_kappa_angle_muddycave,
+    diff_kappa_angle_c2_c3 = effective_kappa_angle_ajcave - effective_kappa_angle_muddycave,
+    diff_zeta_angle_c1_c2 = zeta_angle_lagruta - zeta_angle_ajcave,
+    diff_zeta_angle_c1_c2 = zeta_angle_lagruta - zeta_angle_muddycave,
+    diff_zeta_angle_c1_c2 = zeta_angle_ajcave - zeta_angle_muddycave,
+  ) |>
+  select(starts_with(c("diff_"))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+cave.contrast.dry$season <- 'dry'
+
+#################################################
+# Combine contrasts into single data.frame
+
+cave.contrast <- rbind(cave.contrast.dry, cave.contrast.wet)
+
+```
+
+### Tables
+
+```{r}
+#| label: season-contrasts-all-obs
+#| code-summary: Contrasting caves in the wet season
+
+#################################################
+## 
+
+copy <- cave.contrast
+
+copy$range <- paste0('[', paste(round(copy$.lower,2), round(copy$.upper,2), sep= ' - '), ']')
+copy$model <- ifelse(grepl('angle', copy$measurement), 'Angle', 'Distance')
+copy$type <- ifelse(grepl('kappa', copy$measurement)|grepl('sigma', copy$measurement), 'Effective standard deviation',
+                    ifelse(grepl('M_', copy$measurement), 'Population mean',
+                           ifelse(grepl('zeta', copy$measurement)|grepl('tau', copy$measurement), 'Individual-level variability', 'other')))
+copy$type <- factor(copy$type, levels=c('Population mean', 'Effective standard deviation', 'Individual-level variability', 'other'))
+copy$comparison <- ifelse(grepl('c1_c2', copy$measurement), 'Colony 1 - Colony 2',
+                          ifelse(grepl('c1_c3', copy$measurement), 'Colony 1 - Colony 3', 'Colony 2 - Colony 3'))
+copy$par <- unlist(lapply(strsplit(copy$measurement, '_'), function(x){paste(x[-c(length(x)-1, length(x))], collapse='_')}))
+
+copy <- copy[with(copy, order(comparison, type)),]
+
+knitr:::kable(copy[copy$model=='Distance' & copy$type!='other',c('type', 'comparison', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Season', 'Mean estimate', '95% qi'),
+              caption='Distance model', digits=2)
+
+knitr:::kable(copy[copy$model=='Angle' & copy$type!='other',c('type', 'comparison', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Season', 'Mean estimate', '95% qi'),
+              caption='Angle model', digits=2)
+
+
+```
+
+
+
+## Calculate contrasts between seasons, within cave
+
+### Get contrasts
+```{r}
+#| label: season-contrasts-all
+#| code-summary: Contrasting caves in the wet season
+#| warning: false
+# wet season - dry season
+
+season.contrast <- fit_obs_wet |> 
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(season = "wet") |>
+  bind_rows(
+    fit_obs_dry |> 
+      spread_draws(
+        M_dist_uncentered[c], effective_sigma_dist[c],
+        sigma_dist[c], tau_dist[c],
+        M_angle_uncentered[c], effective_kappa_angle[c],
+        kappa_angle[c], zeta_angle[c]
+      ) |>
+      mutate(season = "dry")
+  ) |>
+  filter(c != 3) |>
+  mutate(cave = if_else(c == 1, "ajcave", "lagruta")) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = season, values_from = -c("cave", "season", starts_with("."))) |>
+  mutate(
+    diff_M_dist = M_dist_uncentered_wet - M_dist_uncentered_dry,
+    diff_sigma_dist = effective_sigma_dist_wet - effective_sigma_dist_dry,
+    diff_tau_dist = tau_dist_wet - tau_dist_dry,
+    diff_M_angle = M_angle_uncentered_wet - M_angle_uncentered_dry,
+    diff_kappa_angle = effective_kappa_angle_wet - effective_kappa_angle_dry,
+    diff_zeta_angle = zeta_angle_wet - zeta_angle_dry,
+  ) |>
+  select(starts_with(c("diff_"))) |>
+  pivot_longer(
+    cols = -c("cave", starts_with(".")),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(cave, measurement) |>
+  mean_qi()
+
+```
+
+### Tables
+```{r}
+#| echo: false
+
+copy <- season.contrast
+
+copy$range <- paste0('[', paste(round(copy$.lower,2), round(copy$.upper,2), sep= ' - '), ']')
+copy$model <- ifelse(grepl('angle', copy$measurement), 'Angle', 'Distance')
+copy$type <- ifelse(grepl('kappa', copy$measurement)|grepl('sigma', copy$measurement), 'Effective standard deviation',
+                    ifelse(grepl('M_', copy$measurement), 'Population mean',
+                           ifelse(grepl('zeta', copy$measurement)|grepl('tau', copy$measurement), 'Individual-level variability', 'other')))
+copy$type <- factor(copy$type, levels=c('Population mean', 'Effective standard deviation', 'Individual-level variability', 'other'))
+copy$comparison <- 'wet - dry'
+copy$par <- unlist(lapply(strsplit(copy$measurement, '_'), function(x){paste(x[-c(length(x)-1, length(x))], collapse='_')}))
+copy$cave <- ifelse(copy$cave=='lagruta', 'colony 1', ifelse(copy$cave=='ajcave', 'colony 2', 'colony 3'))
+
+copy <- copy[with(copy, order(cave, type)),]
+
+knitr:::kable(copy[copy$model=='Distance' & copy$type!='other',c('type', 'comparison', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Distance model', digits=2)
+
+knitr:::kable(copy[copy$model=='Angle' & copy$type!='other',c('type', 'comparison', 'cave', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Colony', 'Mean estimate', '95% qi'),
+              caption='Angle model', digits=2)
+
+
+```
+
+# Contrasting simulation and observations
+
+From how I previously understood our discussions, we wanted to also show that bats forage in a more restricted area than you would expect given the availability of potential foraging locations 
+I don't know whether it is still the plan to include this is the study, but if so, we could also use contrasts derived from the models to achieve this. 
+
+## Visualise observations vs simulations
+
+```{r}
+
+load('data/240502_foraging_all.RData')
+
+foraging <- st_as_sf(foraging, coords=c('long', 'lat'), crs=st_crs('+proj=longlat +datum=WGS84'))
+foraging$type <- factor(foraging$type, levels=c('simulated', 'observed'))
+foraging$cave <- ifelse(foraging$cave=='lagruta', 'colony 1', ifelse(foraging$cave=='ajcave', 'colony 2', 'colony 3'))
+foraging$season <- paste(foraging$season, 'season')
+foraging$label <- paste(foraging$cave, foraging$season, sep=', ')
+
+p1 <- ggplot(st_transform(coastline, st_crs(proj.utm))) +
+  geom_sf(fill='grey', colour='grey10', linewidth=0.2) +
+  geom_sf(data=foraging[foraging$type=='simulated',], colour='black', size=0.5, alpha=0.7) +
+  geom_sf(data=foraging[foraging$type=='observed',], aes(colour=label), size=1.5, alpha=0.3) +
+  scale_colour_manual(name='', values=viridisLite::viridis(12)[c(2,4,7,9,12)]) +
+  scale_alpha(na.value=0, range=c(0.1, 0.95)) +
+  scale_x_continuous(expand=c(0,0), limits=c(257988.3, 408106.8) + c(-5000,5000), breaks=seq(-83, -81.8, 0.4)) +
+  scale_y_continuous(expand=c(0,0), limits=c(952550.9, 1118556.0 ) + c(-5000,5000), breaks=seq(8.6, 10, 0.4)) +
+  theme_light() + theme(strip.background = element_rect(fill=NA),
+        strip.text=element_text(colour='black')) +
+  guides(colour=guide_none()) + 
+  facet_wrap(~season, ncol=1) +
+  # geom_text(aes(x=375000, y=1063500, label='Wet season')) +
+  annotation_scale(location = "bl", line_width = 1) +
+  labs(x='Longitude')
+
+ggsave(plot=p1, width=88, height=160, unit='mm', filename='240628_obs_vs_sim_A.png')
+
+
+p2 <- ggplot(foraging) +
+  geom_histogram(data=foraging[foraging$type=='simulated',], aes(x=(a2cave+360)%%360, y=after_stat(density)), fill='grey90', colour='grey20', breaks=seq(0,360,10)) +
+  facet_grid(season~cave) +
+  theme_light() +
+  geom_vline(data=foraging[foraging$type=='observed',], aes(xintercept=(a2cave+360)%%360, colour=label), linewidth=0.2, alpha=0.5) +
+  scale_colour_manual(name='', values=viridisLite::viridis(12)[c(2,4,7,9,12)]) +
+  # guides(colour=guide_legend(override.aes = list(linewidth=2, alpha=1))) +
+  guides(colour=guide_none()) +
+  labs(x='Angle from cave (degrees)') +
+  scale_y_continuous() +
+  scale_x_continuous(breaks=seq(0,360,90)) +
+  theme(strip.background = element_rect(fill=NA),
+        strip.text=element_text(colour='black'))
+
+ggsave(plot=p2, width=174, height=100, unit='mm', filename='240628_obs_vs_sim_B.png')
+
+# 
+# leg <- legend_grob <-cowplot::get_legend(p2)
+# p2 <- p2 + theme(legend.position='none')
+# 
+# p1 | (p2  / leg) + plot_layout(widths=c(1,1.5), heights=c(0.7, 0.3)) + plot_annotation(tag_levels='A')
+# 
+# ggsave(filename='240628_comparison_obs_sim.png', width=174, height=180, unit='mm')
+
+```
+
+## Proportion of foraging on Isla Colon as opposed to elsewhere
+
+```{r}
+#| warning: false
+#| message: false
+
+library(plyr)
+
+prop <- ddply(foraging, c('type', 'season'), function(x){
+  d <- data.frame(loc=c('elsewhere', 'Isla Colón'), count=c(sum(!x$colon), sum(x$colon)), n=nrow(x))
+  d$prop <- d$count/d$n
+  return(d)
+})
+
+ggplot(prop, aes(x=type, y=prop, fill=loc)) +
+  geom_col(colour='black') + 
+  facet_wrap(~factor(season, labels=c('dry season', 'wet season'))) +
+  scale_fill_manual(name='', values=c('grey80', 'grey30')) +
+  guides(fill=guide_legend(reverse = T)) +
+  labs(y='Proportion of foraging locations') +
+  theme_light() +
+  theme(strip.background = element_rect(fill='white', colour=NA),
+        strip.text=element_text(colour='black'),
+        axis.title.x=element_blank(),
+        legend.position='bottom')
+
+ggsave(filename='240716_proportion_foraging_islacolon.png', width=174, height=80, unit='mm')
+
+```
+
+
+## Compute contrasts
+
+```{r}
+#| label: all-season-params-dist
+#| code-summary: Distance parameters for the wet season
+
+#################################################
+## wet season
+
+wet_contrasts <- bind_rows(
+  fit_obs_wet |>
+    spread_draws(
+      M_dist_uncentered[c], effective_sigma_dist[c], tau_dist[c],
+      M_angle_uncentered[c], effective_kappa_angle[c], zeta_angle[c]
+    ) |>
+    mutate(type = "observed"),
+  fit_sim_wet |>
+    spread_draws(
+      M_dist_uncentered[c], effective_sigma_dist[c], tau_dist[c],
+      M_angle_uncentered[c], effective_kappa_angle[c], zeta_angle[c]
+    ) |>
+    mutate(type = "simulated")
+) |>
+  mutate(cave = if_else(c == 1, "ajcave", "lagruta")) |>
+  group_by(cave, .chain, .iteration, .draw) |>
+  select(-c) |>
+  pivot_wider(names_from = type, values_from = c(M_dist_uncentered, effective_sigma_dist, tau_dist, M_angle_uncentered, effective_kappa_angle, zeta_angle)) |>
+  mutate(
+    diff_M_dist = M_dist_uncentered_observed - M_dist_uncentered_simulated,
+    diff_sigma_dist = effective_sigma_dist_observed - effective_sigma_dist_simulated,
+    diff_tau_dist = tau_dist_observed - tau_dist_simulated,
+    diff_M_angle = M_angle_uncentered_observed - M_angle_uncentered_simulated,
+    diff_kappa_angle = effective_kappa_angle_observed - effective_kappa_angle_simulated,
+    diff_zeta_angle = zeta_angle_observed - zeta_angle_simulated,
+  ) |>
+  group_by(cave)
+
+wet.contrast.cave.dist <- wet_contrasts |>
+  select(cave, diff_M_dist, diff_sigma_dist, diff_tau_dist) |>
+  mean_qi()
+wet.contrast.cave.dist$season <- 'wet'
+
+wet.contrast.cave.angle <- wet_contrasts |>
+  select(cave, diff_M_angle, diff_kappa_angle, diff_zeta_angle) |>
+  mean_qi()
+wet.contrast.cave.angle$season <- 'wet'
+
+#################################################
+## dry season
+
+dry_contrasts <- bind_rows(
+  fit_obs_dry |>
+    spread_draws(
+      M_dist_uncentered[c], effective_sigma_dist[c], tau_dist[c],
+      M_angle_uncentered[c], effective_kappa_angle[c], zeta_angle[c]
+    ) |>
+    mutate(type = "observed"),
+  fit_sim_dry |>
+    spread_draws(
+      M_dist_uncentered[c], effective_sigma_dist[c], tau_dist[c],
+      M_angle_uncentered[c], effective_kappa_angle[c], zeta_angle[c]
+    ) |>
+    mutate(type = "simulated")
+) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta",
+      c == 3 ~ "muddycave"
+    )
+  ) |>
+  group_by(cave, .chain, .iteration, .draw) |>
+  select(-c) |>
+  pivot_wider(names_from = type, values_from = c(M_dist_uncentered, effective_sigma_dist, tau_dist, M_angle_uncentered, effective_kappa_angle, zeta_angle)) |>
+  mutate(
+    diff_M_dist = M_dist_uncentered_observed - M_dist_uncentered_simulated,
+    diff_sigma_dist = effective_sigma_dist_observed - effective_sigma_dist_simulated,
+    diff_tau_dist = tau_dist_observed - tau_dist_simulated,
+    diff_M_angle = M_angle_uncentered_observed - M_angle_uncentered_simulated,
+    diff_kappa_angle = effective_kappa_angle_observed - effective_kappa_angle_simulated,
+    diff_zeta_angle = zeta_angle_observed - zeta_angle_simulated,
+  ) |>
+  group_by(cave)
+
+dry.contrast.cave.dist <- dry_contrasts |>
+  select(cave, diff_M_dist, diff_sigma_dist, diff_tau_dist) |>
+  mean_qi()
+
+dry.contrast.cave.dist$season <- 'dry'
+
+dry.contrast.cave.angle <- dry_contrasts |>
+  select(cave, diff_M_angle, diff_kappa_angle, diff_zeta_angle) |>
+  mean_qi()
+dry.contrast.cave.angle$season <- 'dry'
+
+#################################################
+## combine
+
+contrasts <- rbind(
+  tidyr:::pivot_longer(dry.contrast.cave.angle, cols = -c("cave", starts_with("."), 'season'), names_to = "measurement", values_to = "value"),
+  tidyr:::pivot_longer(dry.contrast.cave.dist, cols = -c("cave", starts_with("."), 'season'), names_to = "measurement", values_to = "value"),
+  tidyr:::pivot_longer(wet.contrast.cave.angle, cols = -c("cave", starts_with("."), 'season'), names_to = "measurement", values_to = "value"),
+  tidyr:::pivot_longer(wet.contrast.cave.dist, cols = -c("cave", starts_with("."), 'season'), names_to = "measurement", values_to = "value"))
+
+contrasts$level <- paste0('.', gsub('.*\\.', '', contrasts$measurement))
+contrasts$measurement <- gsub('\\..*', '', contrasts$measurement)
+contrasts$level <- ifelse(grepl('upper', contrasts$level)|grepl('lower', contrasts$level), contrasts$level, 'value')
+contrasts <- tidyr:::pivot_wider(contrasts, values_from='value', names_from='level', id_cols=c('cave', 'season', 'measurement'))
+
+```
+
+## Tables
+```{r}
+#| echo: false
+
+copy <- contrasts
+
+copy$range <- paste0('[', paste(round(copy$.lower,2), round(copy$.upper,2), sep= ' - '), ']')
+copy$model <- ifelse(grepl('angle', copy$measurement), 'Angle', 'Distance')
+copy$type <- ifelse(grepl('kappa', copy$measurement)|grepl('sigma', copy$measurement), 'Effective standard deviation',
+                    ifelse(grepl('M_', copy$measurement), 'Population mean',
+                           ifelse(grepl('zeta', copy$measurement)|grepl('tau', copy$measurement), 'Individual-level variability', 'other')))
+copy$type <- factor(copy$type, levels=c('Population mean', 'Effective standard deviation', 'Individual-level variability', 'other'))
+copy$comparison <- 'observed - simulated'
+copy$cave <- ifelse(copy$cave=='lagruta', 'cave 1', ifelse(copy$cave=='ajcave', 'cave 2', 'cave 3'))
+
+copy <- copy[with(copy, order(cave, season)),]
+
+knitr:::kable(copy[copy$model=='Distance' & copy$type=='Population mean',c('type', 'comparison', 'cave', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Cave', 'Season', 'Mean estimate', '95% qi'),
+              caption='Distance model - population mean', digits=2)
+
+knitr:::kable(copy[copy$model=='Distance' & copy$type=='Effective standard deviation',c('type', 'comparison', 'cave', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Cave', 'Season', 'Mean estimate', '95% qi'),
+              caption='Distance model - effective standard deviation', digits=2)
+
+knitr:::kable(copy[copy$model=='Distance' & copy$type=='Individual-level variability',c('type', 'comparison', 'cave', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Cave', 'Season', 'Mean estimate', '95% qi'),
+              caption='Distance model - individual-level variability', digits=2)
+
+
+knitr:::kable(copy[copy$model=='Angle' & copy$type=='Population mean',c('type', 'comparison', 'cave', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Cave', 'Season', 'Mean estimate', '95% qi'),
+              caption='Angle model - population mean', digits=2)
+
+knitr:::kable(copy[copy$model=='Angle' & copy$type=='Effective standard deviation',c('type', 'comparison', 'cave', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Cave', 'Season', 'Mean estimate', '95% qi'),
+              caption='Angle model - effective standard deviation', digits=2)
+
+knitr:::kable(copy[copy$model=='Angle' & copy$type=='Individual-level variability',c('type', 'comparison', 'cave', 'season', 'value', 'range')], 
+              col.names=c('Model parameter', 'Comparison', 'Cave', 'Season', 'Mean estimate', '95% qi'),
+              caption='Angle model - individual-level variability', digits=2)
+
+```
+
+
+## Visualisation
+
+This is really to get an idea of how the simulations relate to the real trajectories if this is still something you would like to include in the study. Here, I calculated the distribution of differences between model parameters estimated for simulated and observed foraging locations, always contrasting the same cave and season. All differences are calculated as observation - simulation, so any negative values indicate that the model estimate is higher for simulated locations, and vice versa.
+
+### Figures: Angle to foraging location; contrast between simulation & observation
+
+Main message: mean angle to foraging locations differ between simulation and observation, with exception of La gruta during the wet season. Effective standard deviation is consistently smaller for observations during the dry season at least, indicating that bats foragie in a narrower area than you would expect given availability of land at a similar distance from the colony.
+
+**Note:** thinking about this now, and remembering what mainland Panama looks like in that area, do you think this has anything to do with altitude/topography? We could potentially test this by expanding the current HMM?
+
+```{r}
+#| echo: false
+# fig-cap: Contrasts between (a) mean and (b) standard deviation of angle estimates (contrast: mean of observed foraging locations - mean of simulated foraging locations). Shown are the mean estimate and the 95% credibility interval. The dotted line indicates the expected contrast if observation and simulation were identical.
+
+angle.contrast.cave <- rbind(wet.contrast.cave.angle, dry.contrast.cave.angle)
+angle.contrast.cave$season <- factor(angle.contrast.cave$season, labels=c('dry season', 'wet season'))
+angle.contrast.cave$cave <- factor(angle.contrast.cave$cave, levels=c('muddycave', 'ajcave', 'lagruta'), labels=paste('cave', 3:1))
+
+ggplot(angle.contrast.cave, aes(x=diff_M_angle, xmin=diff_M_angle.lower, xmax=diff_M_angle.upper, 
+                                colour=season, y=cave)) +
+  geom_vline(aes(xintercept=0), linetype=2) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  scale_x_continuous(limits=c(-0.6*pi, 0.6*pi), breaks=seq(-0.5*pi, 0.5*pi, 0.25*pi),
+                     labels=c(expression(-frac(1,2)~pi), expression(-frac(1,4)~pi), 0, expression(frac(1,4)~pi), expression(frac(1,2)~pi))) +
+  labs(title='Contrast of mean angle between simulation and observation',
+       x=expression('M'['angle, sim']-'M'['angle, obs']~'(rad)')) +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+ggsave(filename='contrast_obs_sim_mean_angle.png', width=88, height=80, unit='mm')
+
+ggplot(angle.contrast.cave, aes(x=diff_kappa_angle, xmin=diff_kappa_angle.lower, xmax=diff_kappa_angle.upper, 
+                   colour=season, y=cave)) +
+  geom_vline(aes(xintercept=0), linetype=2) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  labs(title='Contrast in effective standard deviation of mean angle', 
+       x=expression(kappa['eff, sim']-kappa['eff, obs']~'(rad)')) +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+# ggsave(filename='contrast_obs_sim_sd_angle.png', width=88, height=80, unit='mm')
+```
+
+### Figures: Distance to foraging location; contrast between simulation & observation
+
+Main message: observed distances are shorter than simulated distances, but effective standard deviation is lower in observed foraging locations during both seasons.
+
+```{r}
+#| echo: false
+#| warning: false
+
+dist.contrast.cave <- rbind(wet.contrast.cave.dist, dry.contrast.cave.dist)
+dist.contrast.cave$season <- factor(dist.contrast.cave$season, labels=c('dry season', 'wet season'))
+dist.contrast.cave$cave <- factor(dist.contrast.cave$cave, levels=c('muddycave', 'ajcave', 'lagruta'), labels=paste('cave', 3:1))
+
+ggplot(dist.contrast.cave, aes(x=diff_M_dist, xmin=diff_M_dist.lower, xmax=diff_M_dist.upper, 
+                                colour=season, y=cave)) +
+  geom_vline(aes(xintercept=0), linetype=2) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  labs(title='Contrast in mean distance (km)',
+       x=expression('M'['distance, sim']-'M'['distance, obs']~'(rad)')) +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+# ggsave(filename='contrast_obs_sim_mean_dist.png', width=88, height=80, unit='mm')
+
+
+ggplot(dist.contrast.cave, aes(x=diff_sigma_dist, xmin=diff_sigma_dist.lower, xmax=diff_sigma_dist.upper, 
+                   colour=season, y=cave)) +
+  geom_vline(aes(xintercept=0), linetype=2) +
+  geom_pointrange(position=position_dodge(width=0.2)) +
+  scale_colour_viridis_d(option='G', end=0.7, begin=0.3) +
+  labs(title='Contrast in effective sd',
+       x=expression(sigma['eff, sim']-sigma['eff, obs']~'(rad)')) +
+  theme_light() + theme(axis.title.y=element_blank(), legend.title=element_blank())
+
+# ggsave(filename='contrast_obs_sim_sd_dist.png', width=88, height=80, unit='mm')
+
+```
+<!-- # Contrasting caves (simulated data) -->
+
+<!-- ## Wet season -->
+```{r}
+#| label: cave-params-wet-sim
+#| code-summary: Cave parameters in the wet season
+#| eval: false
+#| echo: false
+# Parameters
+fit_sim_wet |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(cave = if_else(c == 1, "ajcave", "lagruta")) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+```
+
+```{r}
+#| label: cave-contrasts-wet-sim
+#| code-summary: Contrasting caves in the wet season
+#| eval: false
+#| echo: false
+# Contrasts (Ajcave - Lagruta)
+fit_sim_wet |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(cave = if_else(c == 1, "ajcave", "lagruta")) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  mutate(
+    diff_M_dist = M_dist_uncentered_ajcave - M_dist_uncentered_lagruta,
+    diff_sigma_dist = effective_sigma_dist_ajcave - effective_sigma_dist_lagruta,
+    diff_M_angle = M_angle_uncentered_ajcave - M_angle_uncentered_lagruta,
+    diff_kappa_angle = effective_kappa_angle_ajcave - effective_kappa_angle_lagruta,
+  ) |>
+  select(starts_with(c("diff_"))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+```
+
+<!-- ## Dry season -->
+```{r}
+#| label: cave-params-dry-sim
+#| code-summary: Cave parameters in the dry season
+#| eval: false
+#| echo: false
+angle_rad |>
+  filter(season == "dry") |>
+  select(cave, dist, angle_rad) |>
+  group_by(cave) |>
+  mean_qi()
+
+# Parameters
+fit_sim_dry |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta",
+      c == 3 ~ "muddycave"
+    )
+  ) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+```
+
+```{r}
+#| label: cave-contrasts-dry-sim
+#| code-summary: Contrasting caves in the dry season
+#| eval: false
+#| echo: false
+# Contrasts
+fit_sim_dry |>
+  spread_draws(
+    M_dist_uncentered[c], effective_sigma_dist[c],
+    sigma_dist[c], tau_dist[c],
+    M_angle_uncentered[c], effective_kappa_angle[c],
+    kappa_angle[c], zeta_angle[c]
+  ) |>
+  mutate(
+    cave = case_when(
+      c == 1 ~ "ajcave",
+      c == 2 ~ "lagruta",
+      c == 3 ~ "muddycave"
+    )
+  ) |>
+  group_by(cave) |>
+  select(-c) |>
+  pivot_wider(names_from = cave, values_from = -c("cave", starts_with("."))) |>
+  mutate(
+    diff_M_dist_a_l = M_dist_uncentered_ajcave - M_dist_uncentered_lagruta,
+    diff_M_dist_a_m = M_dist_uncentered_ajcave - M_dist_uncentered_muddycave,
+    diff_M_dist_l_m = M_dist_uncentered_lagruta - M_dist_uncentered_muddycave,
+    diff_sigma_dist_a_l = effective_sigma_dist_ajcave - effective_sigma_dist_lagruta,
+    diff_sigma_dist_a_m = effective_sigma_dist_ajcave - effective_sigma_dist_muddycave,
+    diff_sigma_dist_l_m = effective_sigma_dist_lagruta - effective_sigma_dist_muddycave,
+    diff_M_angle_a_l = M_angle_uncentered_ajcave - M_angle_uncentered_lagruta,
+    diff_M_angle_a_m = M_angle_uncentered_ajcave - M_angle_uncentered_muddycave,
+    diff_M_angle_l_m = M_angle_uncentered_lagruta - M_angle_uncentered_muddycave,
+    diff_kappa_angle_a_l = effective_kappa_angle_ajcave - effective_kappa_angle_lagruta,
+    diff_kappa_angle_a_m = effective_kappa_angle_ajcave - effective_kappa_angle_muddycave,
+    diff_kappa_angle_l_m = effective_kappa_angle_lagruta - effective_kappa_angle_muddycave
+  ) |>
+  select(starts_with(c("diff_"))) |>
+  pivot_longer(
+    cols = -starts_with("."),
+    names_to = "measurement",
+    values_to = "value"
+  ) |>
+  group_by(measurement) |>
+  mean_qi()
+
+```
+
+## Estimated mean plots
+
+Plots of the estimated means. The spread of the distributions represent the uncertainty around the population means estimated from the observed and simulated data, respectively.
+This is mostly to check whether the model actually reflects the data.
+
+### Wet season
+```{r}
+#| label: wet-mean-estimate-plots
+#| code-summary: Wet season estimated mean plots
+
+obs_data_wet <- angle_rad |>
+  filter(season == "wet") |>
+  select(cave, dist, angle_rad) |>
+  group_by(cave) |>
+  summarise(
+    dist = mean(dist),
+    angle_rad = mean(angle_rad)
+  )
+
+wet_contrasts |>
+  select(starts_with(c(".", "M_dist"))) |>
+  mutate(cave = if_else(cave == 'lagruta', "colony 1", "colony 2")) |>
+  pivot_longer(
+    cols = -c("cave", starts_with(".")),
+    names_to = "type",
+    values_to = "value"
+  ) |>
+  mutate(
+    `Estimated from` = case_when(
+      str_detect(type, "observed") ~ "Observed flights",
+      str_detect(type, "simulated") ~ "Simulated flights"
+    )
+  ) |>
+  ggplot(aes(x = value, fill = `Estimated from`)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_vline(data = obs_data_wet, aes(xintercept = dist), linewidth = 1.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue)) +
+  labs(x = "Average distance (km)", caption = "Black line is the mean of the data.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "bottom") +
+  drop_y_axis()
+
+wet_contrasts |>
+  select(starts_with(c(".", "M_angle"))) |>
+  mutate(cave = if_else(cave == 'lagruta', "colony 1", "colony 2")) |>
+  pivot_longer(
+    cols = -c("cave", starts_with(".")),
+    names_to = "type",
+    values_to = "value"
+  ) |>
+  mutate(
+    `Estimated from` = case_when(
+      str_detect(type, "observed") ~ "Observed flights",
+      str_detect(type, "simulated") ~ "Simulated flights"
+    )
+  ) |>
+  ggplot(aes(x = value, fill = `Estimated from`)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_vline(data = obs_data_wet, aes(xintercept = angle_rad), linewidth = 1.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue)) +
+  labs(x = "Average angle (rad)", caption = "Black line is the mean of the data.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "bottom") +
+  drop_y_axis()
+
+```
+
+### Dry season
+```{r}
+#| label: dry-mean-estimate-plots
+#| code-summary: Wet season estimated mean plots
+
+obs_data_dry <- angle_rad |>
+  filter(season == "dry") |>
+  mutate(
+    cave = case_when(
+      cave == "ajcave" ~ 'colony 2',
+      cave == "lagruta" ~ 'colony 1',
+      cave == "muddycave" ~ 'colony 3'
+    )
+  ) |>
+  select(cave, dist, angle_rad) |>
+  group_by(cave) |>
+  summarise(
+    dist = mean(dist),
+    angle_rad = mean(angle_rad)
+  )
+
+dry_contrasts |>
+  select(starts_with(c(".", "M_dist"))) |>
+    mutate(
+    cave = case_when(
+      cave == "ajcave" ~ 'colony 2',
+      cave == "lagruta" ~ 'colony 1',
+      cave == "muddycave" ~ 'colony 3'
+    )
+  ) |>
+  pivot_longer(
+    cols = -c("cave", starts_with(".")),
+    names_to = "type",
+    values_to = "value"
+  ) |>
+  mutate(
+    `Estimated from` = case_when(
+      str_detect(type, "observed") ~ "Observed flights",
+      str_detect(type, "simulated") ~ "Simulated flights"
+    )
+  ) |>
+  ggplot(aes(x = value, fill = `Estimated from`)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_vline(data = obs_data_dry, aes(xintercept = dist), linewidth = 1.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue)) +
+  labs(x = "Average distance (km)", caption = "Black line is the mean of the data.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "bottom") +
+  drop_y_axis()
+
+dry_contrasts |>
+  select(starts_with(c(".", "M_angle"))) |>
+  pivot_longer(
+    cols = -c("cave", starts_with(".")),
+    names_to = "type",
+    values_to = "value"
+  ) |>
+  mutate(
+    `Estimated from` = case_when(
+      str_detect(type, "observed") ~ "Observed flights",
+      str_detect(type, "simulated") ~ "Simulated flights"
+    )
+  ) |>
+  ggplot(aes(x = value, fill = `Estimated from`)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_vline(data = obs_data_dry, aes(xintercept = angle_rad), linewidth = 1.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue)) +
+  labs(x = "Average angle (rad)", caption = "Black line is the mean of the data.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "bottom") +
+  drop_y_axis()
+
+```
+
+
+<!-- ## Contrast -->
+
+<!-- ### Wet season -->
+```{r}
+#| label: wet-mean-estimate-contrast-plots
+#| code-summary: Wet season estimated mean contrast plots
+#| eval: false
+#| echo: false
+
+wet_contrasts |>
+  mutate(
+    M_dist_contrast = M_dist_uncentered_observed - M_dist_uncentered_simulated,
+  ) |>
+  select(starts_with("."), ends_with("_contrast")) |>
+  ggplot(aes(x = M_dist_contrast)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Difference in average distance (observed - simulated)") +
+  facet_wrap(vars(cave), scales = "free") +
+  drop_y_axis()
+
+wet_contrasts |>
+  mutate(
+    M_angle_contrast = M_angle_uncentered_observed - M_angle_uncentered_simulated
+  ) |>
+  select(starts_with("."), ends_with("_contrast")) |>
+  ggplot(aes(x = M_angle_contrast)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Difference in average angle (observed - simulated)") +
+  facet_wrap(vars(cave), scales = "free") +
+  drop_y_axis()
+
+```
+
+<!-- ### Dry season -->
+```{r}
+#| label: dry-mean-estimate-contrast-plots
+#| code-summary: dry season estimated mean contrast plots
+#| eval: false
+#| echo: false
+
+dry_contrasts |>
+  mutate(
+    M_dist_contrast = M_dist_uncentered_observed - M_dist_uncentered_simulated,
+  ) |>
+  select(starts_with("."), ends_with("_contrast")) |>
+  ggplot(aes(x = M_dist_contrast)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Difference in average distance (observed - simulated)") +
+  facet_wrap(vars(cave), scales = "free") +
+  drop_y_axis()
+
+dry_contrasts |>
+  mutate(
+    M_angle_contrast = M_angle_uncentered_observed - M_angle_uncentered_simulated
+  ) |>
+  select(starts_with("."), ends_with("_contrast")) |>
+  ggplot(aes(x = M_angle_contrast)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Difference in average angle (observed - simulated)") +
+  facet_wrap(vars(cave), scales = "free") +
+  drop_y_axis()
+
+```
+
+## Posterior predictive plots
+Posterior predictive plots based on simulations from the model, also to make sure that the is representative of the data. Basically, given the model fit to the data, what would we expect new data to look like? You'll notice this works better for the dry than the wet season.
+
+### Wet season
+```{r}
+#| label: ppc-plots-wet-dist
+
+fit_obs_wet |>
+  spread_draws(movement_ppc[n, d]) |>
+  mutate(
+    cave = with(obs_wet, cave[n])
+  ) |>
+  filter(d == 1) |>
+  group_by(cave) |>
+  sample_n(200) |>
+  ggplot(aes(x = movement_ppc, fill = cave)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_histogram(data = obs_wet, aes(x = dist), position = "identity", bins = 40, fill = "black", alpha = 0.75) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue)) +
+  labs(x = "Distance (km)", caption = "Data in black. Simulations (colored) are based on 200 draws\neach from the posterior distribution of movement.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "none") +
+  drop_y_axis()
+
+```
+
+```{r}
+#| label: ppc-plots-wet-angle
+
+fit_obs_wet |>
+  spread_draws(movement_ppc[n, d]) |>
+  mutate(
+    cave = with(obs_wet, cave[n])
+  ) |>
+  filter(d == 2) |>
+  group_by(cave) |>
+  sample_n(200) |>
+  ggplot(aes(x = movement_ppc, fill = cave)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_histogram(data = obs_wet, aes(x = angle_rad), position = "identity", bins = 40, fill = "black", alpha = 0.75) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue)) +
+  labs(x = "Angle (rad)", caption = "Data in black. Simulations (colored) are based on 200 draws\neach from the posterior distribution of movement.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "none") +
+  drop_y_axis()
+
+```
+
+## Dry season
+```{r}
+#| label: ppc-plots-dry-dist
+
+fit_obs_dry |>
+  spread_draws(movement_ppc[n, d]) |>
+  mutate(
+    cave = with(obs_dry, cave[n])
+  ) |>
+  filter(d == 1) |>
+  group_by(cave) |>
+  sample_n(500) |>
+  ggplot(aes(x = movement_ppc, fill = cave)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_histogram(data = obs_dry, aes(x = dist), position = "identity", bins = 40, fill = "black", alpha = 0.75) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue, "green")) +
+  labs(x = "Distance (km)", caption = "Data in black. Simulations (colored) are based on 500 draws\neach from the posterior distribution of movement.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "none") +
+  drop_y_axis()
+
+```
+
+```{r}
+#| label: ppc-plots-dry-angle
+
+fit_obs_dry |>
+  spread_draws(movement_ppc[n, d]) |>
+  mutate(
+    cave = with(obs_dry, cave[n])
+  ) |>
+  filter(d == 2) |>
+  group_by(cave) |>
+  sample_n(500) |>
+  ggplot(aes(x = movement_ppc, fill = cave)) +
+  geom_histogram(position = "identity", bins = 40, alpha = 0.5) +
+  geom_histogram(data = obs_dry, aes(x = angle_rad), position = "identity", bins = 40, fill = "black", alpha = 0.75) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(orange, blue, "green")) +
+  labs(x = "Angle (rad)", caption = "Data in black. Simulations (colored) are based on 500 draws\neach from the posterior distribution of movement.") +
+  facet_wrap(vars(cave), scales = "free") +
+  theme(legend.position = "none") +
+  drop_y_axis()
+
+```

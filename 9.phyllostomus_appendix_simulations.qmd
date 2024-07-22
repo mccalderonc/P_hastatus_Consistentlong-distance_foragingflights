@@ -1,0 +1,838 @@
+---
+title: "Appendix: Consistent long-distance foraging flights across years and seasons at colony level in a Neotropical bat"
+date: today
+format: 
+  html:
+    table-of-contents: true
+    code-fold: true
+    embed-resources: true
+---
+
+# Note 
+
+This document contains the development of the Hidden Markov model set up for the simulation of bat nightly trips. This includes the code for the regularisation of trajectories 
+
+# Session set-up
+
+```{r}
+#| label: setup
+#| code-summary: Setup
+#| message: false
+#| warning: false
+
+library(ctmm)
+library(ggplot2)
+library(sf)
+library(suntools)
+library(plyr)
+library(ggspatial)
+library(geosphere)
+library(lubridate)
+library(momentuHMM)
+library(viridisLite)
+library(terra)
+
+proj.ll <- '+proj=longlat +datum=WGS84'
+
+
+```
+
+# Data import
+
+## Cave locations
+
+```{r}
+
+cave.loc <- data.frame(
+  cave=c('lagruta', 'ajcave', 'muddycave'),
+  long=c(-82.271541, -82.274955, -82.264753),
+  lat=c(9.396448, 9.440312, 9.387233)
+)
+
+```
+
+## Land/sea mask
+
+I will be using the administrative boundary data provided by GADM to derive a land/sea mask. FIrst, let's import the administrative boundaries for Panama and Costa Rica and merge them:
+
+```{r}
+
+adm <- rbind(st_read('data/environmental/gadm41_PAN_shp/gadm41_PAN_0.shp', quiet=T),
+             st_read('data/environmental/gadm41_CRI_shp/gadm41_CRI_0.shp', quiet=T))
+
+coastline <- st_union(adm)
+
+```
+
+The next step sets up a grid with a resolution of 100m, and calculates for each grid cell the distance to the nearest land in km (i.e. distance to land for cells within the administrative boundary are 0). The resulting raster is then transformed using log(x+1) The distance calculation takes some time, so I will save the resulting raster for convenience.
+
+```{r}
+#| eval: false
+
+library(terra)
+
+mask <- st_transform(coastline, st_crs(proj.utm))
+mask <- rasterize(vect(mask), y=rast(extent=ext(c(50000, 750000, 750000, 1300000)), resolution=c(100,100)), values=1, background=0)
+
+crs(mask) <- proj.utm
+d2coast <- distance(mask, vect(st_transform(coastline, st_crs(proj.utm))))
+d2coast <- log1p(d2coast/1000)
+
+writeRaster(d2coast, filename='output/d2coast_100m.tif', filetype='GTiff')
+
+```
+```{r}
+#| include: false
+
+d2coast <- rast('data/d2coast_100m.tif')
+
+```
+
+## Tracking data
+
+Importing the data with annotated behavior following from the initial HMM, and making some changes to naming/labelling:
+
+```{r}
+
+load('data/Phyllostomus2021-2022_HMMbehaviors.RData')
+
+# rename caves
+bats_behaviors$cave[bats_behaviors$cave=='LG'] <- 'lagruta'
+bats_behaviors$cave[bats_behaviors$cave=='MT'] <- 'ajcave'
+
+# remove columns that contain no data
+bats_behaviors <- bats_behaviors[,apply(bats_behaviors, 2, function(x){any(!is.na(x))})]
+
+# assign season
+bats_behaviors$season <- ifelse(bats_behaviors$month %in% c('Aug', 'Dec'), 'wet', 'dry')
+
+# assign "day" by calculating time of day relative to solar noon
+p <- st_as_sf(bats_behaviors, coords=c('location_long', 'location_lat'), crs=st_crs(proj.ll))
+noon <- solarnoon(p, bats_behaviors$timestamp, POSIXct.out=T)
+
+# fractional hours after noon
+bats_behaviors$tod <- as.numeric(difftime(bats_behaviors$timestamp, noon$time, units = 'h'))%%24
+
+# split individual tracks into separate days
+bats_behaviors <- ddply(bats_behaviors, 'individual_id', function(x){
+  x$day <- c(0, cumsum(diff(x$tod)<0)) + 1
+  return(x)
+})
+
+```
+
+To be able to use spatial covariates and produce sensible simulations directly from the HMM, we need to reproject the entire data from long-lat to a metric coordinate reference system. Since momentuHMM can calculate step lengths for either long-lat or UTM, so we can use the respective UTM zone for Panama. 
+
+```{r}
+
+# reprojecting everything (UTM zone 17N)
+proj.utm <- '+proj=utm +zone=17 +ellps=GRS80 +units=m +no_defs +type=crs'
+mask <- st_transform(coastline, st_crs(proj.utm))
+
+p <- st_as_sf(bats_behaviors, coords=c('location_long', 'location_lat'), crs=st_crs(proj.ll))
+p <- st_transform(p, st_crs(proj.utm))
+bats_behaviors$x.utm <- st_coordinates(p)[,1]
+bats_behaviors$y.utm <- st_coordinates(p)[,2]
+
+```
+
+### Regularisation
+
+Over the years tracking data were collected with different settings, while some of the tracks have issues with not perfectly regular data. Slight irregularities are probably fine, but for the HMM it will be necessary to derive a dataset with at least near-regular observations. Large irregularities can cause issues as step lengths to increase/decrease with longer/shorter observation intervals. As the HMM will have to account for these observations, they can have a serious impact on the resulting distributions describing the observation parameters for the different states. 
+
+We will use the correlated random walk models implemented in the **momentuHMM**-package (via the package **crawl**). In my experience, the mean estimates of single-state crawl models estimated for tracks capturing widely different modes of movement (e.g. resting behaviour and short shuttling flights between food tree and feeding roost) don't always look great yet tend to still produce reasonable interpolations of the tracks. 
+
+Let's first have a look at sampling intervals before regularisation to determine what would be a good interval to choose for the interpolation:
+
+```{r}
+
+## check sampling intervals
+check.dt.before <- ddply(bats_behaviors, 'ID', function(x){
+  data.frame(dt=diff(as.numeric(x$timestamp)))
+})
+
+ggplot(check.dt.before, aes(x=dt)) +
+  geom_histogram(fill='grey90', colour='grey20') + 
+  scale_y_sqrt() + scale_x_sqrt(breaks=c(0,120,1200,3600,7200,14400,43200)) +
+  labs(x='Sampling interval (seconds)') +
+  theme_light()
+
+```
+
+The most common sampling interval was at around 120 seconds, which would make this a good interval for interpolating the tracks. Let's fit a CRW model using crawl and interpolate tracks accordingly. As this step takes quite some time, I will save the output for convenience:
+
+```{r}
+#| eval: false
+
+bats.reg <- crawlWrap(bats_behaviors, timeStep=120, coord=c('x.utm', 'y.utm'), Time.name='timestamp')
+
+save(bats.reg, file='240411_bats_regularised_crawl.RData')
+
+```
+```{r}
+#| include: false
+
+load('data/240411_bats_regularised_crawl.RData')
+
+```
+
+
+### Prepare data for HMM
+
+The steps included here are meant to set up the data for the HMM, which includes annotation with time of day, distance to land, as well as the distance and angle of locations to the respective cave of the individual.
+
+```{r}
+
+# prepare cave locations for angle calculation
+p.caves <- st_as_sf(cave.loc, coords=c('long', 'lat'), crs=st_crs(proj.ll))
+p.caves <- st_transform(p.caves, st_crs(proj.utm))
+caves <- as.matrix(st_coordinates(p.caves))
+dimnames(caves)[[1]] <- cave.loc$cave
+
+# drop previously computed step ang angle columns to avoid conflicts with prepData()-function
+bats.reg$crwPredict <- bats.reg$crwPredict[-which(names(bats.reg$crwPredict) %in% c('step', 'angle'))]
+
+bats.reg$crwPredict <- ddply(bats.reg$crwPredict, 'ID', function(x){
+  # calculate time of day relative to solar noon
+  p <- st_as_sf(x, coords=c('mu.x', 'mu.y'), crs=st_crs(proj.utm))
+  noon <- solarnoon(p, x$timestamp, POSIXct.out=T)
+  x$tod <- as.numeric(difftime(x$timestamp, noon$time, units = 'h'))%%24
+  
+  # annotate locations with distance to land
+  x$d2coast <- extract(d2coast, vect(p))$layer
+  
+  # assign cave
+  x$cave <- unique(x$cave[!is.na(x$cave)])
+  return(x)
+})
+
+# convert data to momentuHMM format
+bats <- prepData(bats.reg, 
+                 # coordNames = c('x.utm', 'y.utm'), 
+                 # covNames=c('cave'), 
+                 type = 'UTM', 
+                 centers = caves)#, 
+                 # spatialCovs = list(mask=raster(as.factor(mask))))
+
+# make new angle covariate choosing the angle to the respective cave for each individual
+bats$cave.angle <- unlist(lapply(1:nrow(bats), function(j){
+  keep <- ifelse(bats$cave[j]=='lagruta', bats$lagruta.angle[j], 
+                 ifelse(bats$cave[j]=='ajcave', bats$ajcave.angle[j], bats$muddycave.angle[j]))
+}))
+
+# make new distance covariate choosing the angle to the respective cave for each individual
+bats$cave.dist <- unlist(lapply(1:nrow(bats), function(j){
+  keep <- ifelse(bats$cave[j]=='lagruta', bats$lagruta.dist[j], 
+                 ifelse(bats$cave[j]=='ajcave', bats$ajcave.dist[j], bats$muddycave.dist[j]))
+}))
+
+# # some more preparatory steps
+# set steps exceeding what would be expected at a speed of 40 m/s to NA
+bats$step[bats$step>((120*40))] <- NA
+
+```
+
+# Hidden Markov models
+
+## Simple model for parametrisation
+
+We will start with a simple model as these tend to be easier to parametrise. This model will be characterised by:
+
+- 3 states: foraging movements, outbound commutes (cave -> foraging), inbound commutes (foraging -> cave)
+- 1 covariate on the transition probability matrix: time of day, as circular covariate
+- 2 data streams derived from observations: step length (in m) and angle to cave (in radians)
+- step and angle distribution as well as starting parameters (for step length) are based on first HMM
+
+```{r}
+#| eval: false
+
+# time of day as covariate on the transition probability matrix
+tpm.formula <- ~cosinor(tod, 24)
+
+# fit simple model with 3 states and starting
+mod.smpl <- fitHMM(data=bats,
+                   nbStates=3, # number of states
+                   dist=list(step='gamma', cave.angle='wrpcauchy'), # distributions for observations
+                   estAngleMean=list(cave.angle=TRUE), # estimate mean angle for angle to cave?
+                   Par=list(step=c(0.07,1.15,1.40, # starting parameters
+                                   0.1,0.5,0.75),
+                           cave.angle=c(0, pi, 0, 
+                                   0.3,0.7,0.7)),
+                 formula=tpm.formula, # formula for the transition probability matrix
+                 stateNames=c('foraging','outbound','inbound')) # names for movement states
+
+```
+
+## Adding a distance to land as covariate on the transition probability matrix:
+
+The only spatial covariate we only really need is the land/sea mask, and we will tell the model in advance that it is impossible to switch to the foraging state when not above land. I will further constrain the transition probability matrix so it becomes impossible to switch from outbound to inbound commute directly (and vice versa); i.e. bats have to forage in between outbound and inbound commute
+
+```{r}
+#| eval: false
+
+# extend formula on tpm
+tpm.formula <- ~state1(d2coast) + cosinor(tod, 24)
+
+# fix transitions so constrain transitions to foraging above water
+# fix transitions
+fix.beta <- matrix(c(NA,NA, NA,-100, NA,-100,
+                     # NA,NA, NA,NA,   NA,NA,
+                     rep(NA, 12),
+                     NA,NA, -100,-100, -100,-100), nrow=4,byrow=T)
+
+#################################################
+## model
+
+mod.mask <- fitHMM(data=bats,
+                 nbStates=3,
+                 dist=list(step='gamma', cave.angle='wrpcauchy'), 
+                 estAngleMean=list(cave.angle=TRUE),
+                 Par=list(step=c(0.07,1.15,1.40,
+                                   0.1,0.5,0.75),
+                          cave.angle=c(pi, pi, 0, 
+                                 0.3,0.7,0.7)),
+                 formula=tpm.formula,
+                 fixPar=list(beta=fix.beta),
+                 stateNames=c('foraging','outbound','inbound'))
+
+```
+
+
+## Rewrite existing model as biased correlated random walk model for commuting behaviour
+
+With this prior information from the simple model, we can can re-write the commuting states as biased correlated random walks. We will also fix the sign of the bias for the two commuting states so that outbound commutes are pushed away from the cave (negative bias), and inbound commutes are pulled towards the cave (positive bias).
+In this model, we are further adding and interaction term for distance to land.
+
+```{r}
+#| eval: false
+
+#################################################
+## angle formula + fixpar
+
+angle.formula <- ~ state2(cave.angle) + state3(cave.angle)
+fix.angle <- c(-1,1,NA,NA,NA)
+
+#################################################
+## formula on tpm + fixpar
+
+tpm.formula <- ~d2coast + d2coast:I(d2coast>0) + cosinor(tod, 24)
+fix.beta <- matrix(c(NA,NA, NA,-100, NA,-100,
+                     # NA,NA, NA,NA,   NA,NA,
+                     rep(NA, 24)), ncol=6,byrow=T)
+
+#################################################
+## formula on state distribution
+
+bats$tod.frac <- bats$tod * pi/24
+delta.formula <- ~cos(tod.frac) + sin(tod.frac)# same as cosinor(tod), but needed to be specified as the cosinor function does not work here
+
+#################################################
+## model
+
+mod.bcrw.unknown <- fitHMM(data=bats,
+                 nbStates=3,
+                 dist=list(step='gamma', angle='wrpcauchy'), 
+                 estAngleMean=list(angle=TRUE),
+                 circularAngleMean=list(angle=0),
+                 Par=list(step=c(0.07,1.15,1.40,
+                                   0.1,0.5,0.75)*1000,
+                         angle=c(pi, 0, 
+                                 0.3,0.7,0.7)),
+                 DM=list(angle=list(mean=angle.formula, concentration=~1)),
+                 formula=tpm.formula,
+                 # knownStates=knownstates,
+                 fixPar=list(beta=fix.beta, angle=fix.angle),
+                 stateNames=c('foraging','outbound','inbound'))
+
+```
+
+## Separate models for wet and dry season
+
+Now that we have successfully established the final structure for the HMM, we can fit separate models for wet and dry season to allow for potential differences in movement behaviour and dynamics (state-switching) to carry over to the simulations.
+
+```{r}
+#| include: false
+
+angle.formula <- ~ state2(cave.angle) + state3(cave.angle)
+fix.angle <- c(-1,1,NA,NA,NA)
+
+#################################################
+## formula on tpm + fixpar
+
+tpm.formula <- ~d2coast + d2coast:I(d2coast>0) + cosinor(tod, 24)
+fix.beta <- matrix(c(NA,NA, NA,-100, NA,-100,
+                     # NA,NA, NA,NA,   NA,NA,
+                     rep(NA, 24)), ncol=6,byrow=T)
+
+#################################################
+## formula on state distribution
+
+bats$tod.frac <- bats$tod * pi/24
+delta.formula <- ~cos(tod.frac) + sin(tod.frac)# same as cosinor(tod), but needed to be specified as the cosinor function does not 
+
+```
+Dry season:
+
+```{r}
+#| cache: true
+bats$season <- unlist(lapply(bats$ID, function(id){
+  unique(bats$season[!is.na(bats$season) & bats$ID==id])
+}))
+
+# model for dry season
+mod.bcrw.dry <- fitHMM(data=bats[bats$season=='dry',],
+                 nbStates=3,
+                 dist=list(step='gamma', angle='wrpcauchy'), 
+                 estAngleMean=list(angle=TRUE),
+                 circularAngleMean=list(angle=0),
+                 Par=list(step=c(0.07,1.15,1.40,
+                                   0.1,0.5,0.75)*1000,
+                         angle=c(pi, 0, 
+                                 0.3,0.7,0.7)),
+                 DM=list(angle=list(mean=angle.formula, concentration=~1)),
+                 formula=tpm.formula,
+                 fixPar=list(beta=fix.beta, angle=fix.angle),
+                 stateNames=c('foraging','outbound','inbound'))
+
+plot(mod.bcrw.dry, plotTracks=T, animals=4, ask=F, plotCI=T)
+
+plotPR(mod.bcrw.dry)
+
+```
+
+Wet season:
+
+```{r}
+#| cache: true
+# model for wet season
+mod.bcrw.wet <- fitHMM(data=bats[bats$season=='wet',],
+                 nbStates=3,
+                 dist=list(step='gamma', angle='wrpcauchy'), 
+                 estAngleMean=list(angle=TRUE),
+                 circularAngleMean=list(angle=0),
+                 Par=list(step=c(0.07,1.15,1.40,
+                                   0.1,0.5,0.75)*1000,
+                         angle=c(pi, 0, 
+                                 0.3,0.7,0.7)),
+                 DM=list(angle=list(mean=angle.formula, concentration=~1)),
+                 formula=tpm.formula,
+                 fixPar=list(beta=fix.beta, angle=fix.angle),
+                 stateNames=c('foraging','outbound','inbound'))
+
+plot(mod.bcrw.wet, plotTracks=T, animals=7, ask=F, plotCI=T)
+
+plotPR(mod.bcrw.wet)
+
+# save models for convenience
+save(mod.bcrw.wet, mod.bcrw.dry, file='240716_mod_bcrw_by_season.RData')
+
+```
+
+# Simulations
+
+```{r}
+#| include: false
+
+load('data/240415_mod_bcrw.RData')
+load('data/240415_mod_bcrw_by_season.RData')
+
+```
+
+## Covariates for simulation
+
+Since we included covariates in the HMMs, we can take these into account for the simulations as well.
+
+### Time of day
+
+Set up time series to allow simulations to take time of day into account
+Day was chosen randomly.
+
+```{r}
+
+# prepare time of day for simulation
+ts <- seq.POSIXt(as.POSIXct('2023-02-24 00:00:00', tz='UTC'), as.POSIXct('2023-02-24 12:00:00', tz='UTC'), by=120)
+p <- st_as_sf(cave.loc[1,], coords=c('long', 'lat'), crs=st_crs(proj.ll))
+noon <- solarnoon(p, ts, POSIXct.out=T)
+tod <- data.frame(tod=as.numeric(difftime(ts, noon$time, units = 'h'))%%24)
+
+```
+
+### Distance to land
+
+No need to prepare anything as we already have the raster ready to go. When determining the extent for the original distance to land calculations, I made sure it would be of sufficient large with respect to spatial extent. 
+
+## Simulating bat trips
+
+The **momentuHMM**-package comes with a tool for simulating time series from fitted HMMs. This allows users to see whether the model meaningfully captures the observed behaviour, but can also be useful in studies like this to explore how well the observations reflect our biological model of bat foraging trips. 
+
+For each colony and season, we will simulate $N_{i,j}\times3$ trips, with $N_i$ representing the number of observed bat-nights for colony $i$ during season $j$. We decided to simulate more trips as simulated trips will radiate out from the respective starting location (cave), and not all simulations will "hit" land. Simulating three times as many trips as observed trips should give us a similar sample size for observed and simulated foraging locations.
+
+### Colony 1
+
+```{r}
+#| eval: false
+
+# use cave location as starting point for the simulation
+cave <- matrix(as.vector(caves[1,]), ncol=2, byrow=T, dimnames=list('cave', c('x', 'y')))
+
+# run 181 x 3 simulations for la gruta, dry season
+lg.dry <- simData(nbAnimals=181*3, 
+                model=mod.bcrw.dry, 
+                states=T, 
+                spatialCovs=list(d2coast=raster(d2coast)),
+                covs=tod,
+                initialPosition=as.vector(caves[1,]),
+                centers=cave, 
+                obsPerAnimal = c(104,203))
+
+lg.dry$cave <- 'lagruta'
+lg.dry$season <- 'dry'
+
+# run 38x3 simulations for la gruta, wet season
+lg.wet <- simData(nbAnimals=38*3, 
+                model=mod.bcrw.wet, 
+                states=T, 
+                spatialCovs=list(d2coast=raster(d2coast)),
+                covs=tod,
+                initialPosition=as.vector(caves[1,]),
+                centers=cave, 
+                obsPerAnimal = c(104,203))
+
+lg.wet$cave <- 'lagruta'
+lg.wet$season <- 'wet'
+
+lg <- rbind(lg.dry, lg.wet)
+lg$type <- 'simulation'
+rm(list=c('lg.dry', 'lg.wet'))
+
+```
+
+What do these simulations look like?
+Note that the trips that are not headed towards land never switch to foraging behaviour and just keep going. This behaviour of the simulation is intended, and a consequence of constraints on state-switching as defined in the model: the distance to land covariate ensures that simulations can only switch to foraging behaviour *above land*, whereas the constraints on state-switching means the simulations cannot switch from outbound to inbound commute directly.
+
+```{r}
+#| include: false
+
+load('data/240418_simulations_all.RData')
+
+```
+```{r}
+#| fig-cap: Figure shows simulations for colony 1 for dry and wet season.
+
+ggplot(simu[simu$cave=='lagruta',]) +
+  geom_sf(data=st_transform(adm, st_crs(proj.utm)), fill='antiquewhite', colour='antiquewhite4', linewidth=0.2) + 
+  xlim(range(simu$x)) + ylim(range(simu$y)) +
+  geom_path(aes(x=x, y=y, group=ID)) + 
+  geom_point(aes(x=x, y=y, colour=factor(states, labels=c('foraging', 'outbound commute', 'inbound commute'))), size=0.3) +
+  geom_point(data=simu[simu$cave=='lagruta' & simu$states==1,], aes(x=x, y=y, colour=factor(states, labels=c('foraging'))), size=0.3) +
+  scale_colour_viridis_d(name='') +
+  theme_light() +
+  guides(colour=guide_legend(override.aes = list(size=2))) +
+  labs(title='Colony 1') +
+  facet_wrap(~season, ncol=2)
+  
+```
+
+### Colony 2
+
+```{r}
+#| eval: false
+
+# define cave as starting point
+cave <- matrix(as.vector(caves[2,]), ncol=2, byrow=T, dimnames=list('cave', c('x', 'y')))
+
+# run 121x3 simulations for colony 2, dry season
+aj.dry <- simData(nbAnimals=121*3, 
+                model=mod.bcrw.dry, 
+                states=T, 
+                spatialCovs=list(d2coast=raster(d2coast)),
+                covs=tod,
+                initialPosition=as.vector(caves[1,]),
+                centers=cave, 
+                obsPerAnimal = c(104,203))
+
+aj.dry$cave <- 'ajcave'
+aj.dry$season <- 'dry'
+
+# run 38x3 simulations for colony 2, wet season
+aj.wet <- simData(nbAnimals=38*3, 
+                model=mod.bcrw.wet, 
+                states=T, 
+                spatialCovs=list(d2coast=raster(d2coast)),
+                covs=tod,
+                initialPosition=as.vector(caves[1,]),
+                centers=cave, 
+                obsPerAnimal = c(104,203))
+
+aj.wet$cave <- 'ajcave'
+aj.wet$season <- 'wet'
+
+aj <- rbind(aj.dry, aj.wet)
+aj$type <- 'simulation'
+rm(list=c('aj.dry', 'aj.wet'))
+
+
+```
+
+### Colony 3
+
+```{r}
+#| eval: false
+
+# define cave as starting point
+cave <- matrix(as.vector(caves[3,]), ncol=2, byrow=T, dimnames=list('cave', c('x', 'y')))
+
+# run 46x3 simulations for colony 3, dry season
+muddy <- simData(nbAnimals=46*3, 
+                model=mod.bcrw.dry, 
+                states=T, 
+                spatialCovs=list(d2coast=raster(d2coast)),
+                covs=tod,
+                initialPosition=as.vector(caves[1,]),
+                centers=cave, 
+                obsPerAnimal = c(104,203))
+
+muddy$cave <- 'muddycave'
+muddy$season <- 'dry'
+muddy$type <- 'simulation'
+
+```
+
+Save simulations to file:
+
+```{r}
+#| eval: false
+
+simu <- do.call('rbind', list(lg, aj, muddy))
+
+save(simu, file='output/240418_simulations_all.RData')
+
+```
+
+
+# Extract observed and simulated foraging locations
+
+## Prepare data
+
+First location of a subsequent segment considered as foraging. I'll be using Camila's classification for the actual observations, and of course the states provided by the simulation. This can be more than one location per individual and night as individuals can use multiple locations. 
+
+```{r}
+#| include: false
+
+load("data/240502_foraging_all.RData")
+load('data/240418_simulations_all.RData')
+
+```
+```{r}
+#| eval: false
+
+# extract foraging locations from original HMM
+foraging.observed <- ddply(bats_behaviors, c('cave', 'season', 'ID'), function(x){
+  x$seg <- c(0, cumsum(diff(as.numeric(factor(x$behav)))!=0)) + 1
+  if(!any(x$behav=='foraging')){return(NULL)}
+  new <- ddply(x[x$behav=='foraging',], 'seg', function(y){
+    dur <- abs(diff(range(as.numeric(y$timestamp))))
+    return(data.frame(long=y$location_long[1], lat=y$location_lat[1], duration=dur, individual=unique(y$individual_id)))
+  })
+  return(new[,-1])
+})
+
+foraging.observed$type <- 'observed'
+
+# only keep segments with duration > 0
+foraging.observed <- foraging.observed[foraging.observed$duration>0,]
+
+# calculate angle & distance to cave
+foraging.observed <- ddply(foraging.observed, c('cave', 'season', 'ID'), function(x){
+  x$d2cave <- distGeo(x[,c('long', 'lat')], cave.loc[cave.loc$cave==unique(x$cave),2:3])/1000
+  x$a2cave <- bearing(cave.loc[cave.loc$cave==unique(x$cave),2:3], x[,c('long', 'lat')])
+  return(x)
+})
+
+###################################################################################################
+# repeat for simulated foraging locations
+
+foraging.simulated <- ddply(simu, c('cave', 'season', 'ID'), function(x){
+  x$seg <- c(0, cumsum(diff(x$states)!=0)) + 1
+  if(!any(x$states=='1')){return(NULL)}
+  new <- ddply(x[x$states=='1',], 'seg', function(y){
+    dur <- (nrow(y)*120)-120
+    return(data.frame(long=y$x[1], lat=y$y[1], duration=dur, individual=paste(unique(y$cave), unique(y$season), sprintf('%.3d', unique(as.numeric(y$ID))), sep='-')))
+  })
+  return(new[,-1])
+})
+
+foraging.simulated$type <- 'simulated'
+
+# only keep segments with duration > 0
+foraging.simulated <- foraging.simulated[foraging.simulated$duration>0,]
+
+# reproject to long-lat
+p <- st_as_sf(foraging.simulated, coords=c('long', 'lat'), crs=st_crs(proj.utm))
+p <- st_transform(p, st_crs(proj.ll))
+foraging.simulated$long <- st_coordinates(p)[,1]
+foraging.simulated$lat <- st_coordinates(p)[,2]
+
+# calculate angle & distance to cave
+foraging.simulated <- ddply(foraging.simulated, c('cave', 'season', 'ID'), function(x){
+  x$d2cave <- distGeo(x[,c('long', 'lat')], cave.loc[cave.loc$cave==unique(x$cave),2:3])/1000
+  x$a2cave <- bearing(cave.loc[cave.loc$cave==unique(x$cave),2:3], x[,c('long', 'lat')])
+  return(x)
+})
+
+# combine observed & simulated
+
+foraging <- rbind(foraging.observed, foraging.simulated)
+
+```
+
+Which foraging locations did the simulated bats "use"?
+
+```{r}
+
+ggplot(simu) +
+  geom_sf(data=st_transform(adm, st_crs(proj.utm)), fill='antiquewhite', colour='antiquewhite4', linewidth=0.2) + 
+  xlim(range(simu$x)) + ylim(range(simu$y)) +
+  geom_path(aes(x=x, y=y, group=paste(cave, season, ID, sep='-')), linewidth=0.1) + 
+  # geom_point(data=simu[simu$states==1,], aes(x=x, y=y, colour=factor(states, labels=c('foraging', 'outbound commute', 'inbound commute'))), size=0.3) +
+  geom_point(data=simu[simu$states==1,], aes(x=x, y=y, colour=factor(cave, levels=c('lagruta', 'ajcave', 'muddycave'), labels=paste('colony', 1:3))), size=0.3) +
+  scale_colour_viridis_d(name='', option='C', begin=0.3, end=0.9, direction=-1) +
+  theme_light() +
+  guides(colour=guide_legend(override.aes = list(size=2))) +
+  facet_wrap(~season, ncol=2)
+
+
+```
+
+## Visualisation: Observed and simulated foraging locations
+
+```{r}
+#| fig-caption: The map shows the location of observed and simulated foraging locations as determined in the steps above. Observed foraging locations are shown in orange, simulated locations in blue.
+
+ggplot() +
+  geom_sf(data=adm, fill='antiquewhite', colour='antiquewhite4', linewidth=0.2) +  
+  xlim(range(foraging$long)) + ylim(range(foraging$lat)) +
+  theme_light() +
+  theme(axis.title=element_blank(), 
+        panel.grid=element_blank(),
+        plot.background = element_rect(fill = "white", color = NA), 
+        panel.background = element_rect(fill = '#dcebf0', color = NA), 
+        legend.background = element_rect(fill = "white", color = NA), ##f5f5f2
+        panel.border = element_blank()) +
+  annotation_scale(location = "tr", line_width = 1) +
+  labs(x='Longitude', y='Latitude') +
+  geom_point(data=foraging[foraging$type=='simulated',], aes(x=long, y=lat, colour=type), alpha=0.1, size=0.5) +
+  geom_point(data=foraging[foraging$type=='observed',], aes(x=long, y=lat, colour=type), alpha=.5, size=0.5) +
+  scale_colour_viridis_d(end=0.8, option='C', name='', direction=-1) +
+  facet_grid(season~factor(cave, levels=c('lagruta', 'ajcave', 'muddycave'), labels=paste('colony', 1:3))) +
+  labs(title='Foraging sites (first location)') +
+  theme(strip.background = element_rect(fill='white'), strip.text=element_text(colour='black', face='bold')) +
+  theme(legend.position='bottom') +
+  guides(colour=guide_legend(override.aes = list(size=2, alpha=1)))
+
+# ggsave(filename='240418_locations_obs_vs_sim.png', width=200, height=120, unit='mm')
+
+```
+
+### Visualisation: Foraging locations + time spent
+
+```{r}
+#| fig-caption: This map shows the same as above, only that the transparency of locations indicates the time individuals/simulations spent at a given foraging location. Less transparency indicates larger amounts of time spent. 
+
+ggplot() +
+  geom_sf(data=adm, fill='antiquewhite', colour='antiquewhite4', linewidth=0.2) +  
+  xlim(range(foraging$long)) + ylim(range(foraging$lat)) +
+  theme_light() +
+  theme(axis.title=element_blank(), 
+        panel.grid=element_blank(),
+        plot.background = element_rect(fill = "white", color = NA), 
+        panel.background = element_rect(fill = '#dcebf0', color = NA), 
+        legend.background = element_rect(fill = "white", color = NA), ##f5f5f2
+        panel.border = element_blank()) +
+  annotation_scale(location = "tr", line_width = 1) +
+  labs(x='Longitude', y='Latitude') +
+  scale_alpha(name='Duration (min)') +
+  geom_point(data=foraging[foraging$type=='simulated',], aes(x=long, y=lat, colour=type, alpha=duration/60)) +
+  geom_point(data=foraging[foraging$type=='observed',], aes(x=long, y=lat, colour=type, alpha=duration/60)) +
+  scale_colour_viridis_d(end=0.8, option='C', name='', direction=-1) +
+  facet_grid(season~factor(cave, levels=c('lagruta', 'ajcave', 'muddycave'), labels=paste('colony', 1:3))) +
+  labs(title='Foraging sites (first location)') +
+  theme(strip.background = element_rect(fill='white'), strip.text=element_text(colour='black', face='bold')) +
+  theme(legend.position='bottom') +
+  guides(colour=guide_legend(override.aes = list(size=2, alpha=1)))
+
+
+```
+
+### Distance and angle to foraging locations
+
+```{r}
+#| fig-caption: This figure shows the distribution of angle to the cave (in degrees) from the respective cave to foraging locations. The upper row shows the data for observed foraging locations, whereas the lower row the data for simulated locations. Colours indicate the different seasons. 
+
+ggplot() +
+  theme_light() +
+  labs(x='Bearing (deg)') +
+  geom_histogram(data=foraging[foraging$type=='simulated',], aes(x=(a2cave+360)%%360, fill=season), alpha=0.5, breaks=seq(0,360,15)) +
+  geom_histogram(data=foraging[foraging$type=='observed',], aes(x=(a2cave+360)%%360, fill=season), alpha=0.5, breaks=seq(0,360,15)) +
+  scale_fill_viridis_d(end=0.8, option='C', name='', direction=-1) +
+  facet_grid(type~factor(cave, levels=c('lagruta', 'ajcave', 'muddycave'), labels=paste('colony', 1:3)), scales='free_y') +
+  theme(legend.position='bottom') +
+  labs(title='Bearing from cave to foraging locations') +
+  theme(strip.background = element_rect(fill='white'), strip.text=element_text(colour='black', face='bold')) +
+  guides(colour=guide_legend(override.aes = list(size=2, alpha=1)))
+
+# ggsave(filename='240717_bearing_obs_vs_sim.png', width=200, height=120, unit='mm')
+```
+```{r}
+#| fig-caption: This figure shows the distribution of distance to the cave (in km) from the respective cave to foraging locations. The upper row shows the data for observed foraging locations, whereas the lower row the data for simulated locations. Colours indicate the different seasons. Note that the x-axis was squareroot transformed for increased legibility.
+#| message: false
+
+ggplot() +
+  theme_light() +
+  labs(x='Distance (km)') +
+  geom_histogram(data=foraging[foraging$type=='simulated',], aes(x=d2cave, fill=season), alpha=0.5) +
+  geom_histogram(data=foraging[foraging$type=='observed',], aes(x=d2cave, fill=season), alpha=0.5) +
+  scale_fill_viridis_d(end=0.8, option='C', name='', direction=-1) +
+  facet_grid(type~factor(cave, levels=c('lagruta', 'ajcave', 'muddycave'), labels=paste('colony', 1:3)), scales='free_y') +
+  scale_x_sqrt(breaks=c(0,1,5,10,25,50,100)) +
+  theme(legend.position='bottom') +
+  labs(title='Distance from cave to foraging locations') +
+  theme(strip.background = element_rect(fill='white'), strip.text=element_text(colour='black', face='bold')) +
+  guides(colour=guide_legend(override.aes = list(size=2, alpha=1)))
+
+# ggsave(filename='240717_distance_obs_vs_sim.png', width=200, height=120, unit='mm')
+```
+## Determine location of observed and simulated foraging locations
+
+We will distinguish between Isla Colón, other islands in the erchipelago, and the mainland:
+
+```{r}
+
+p <- st_as_sf(foraging, coords=c('long', 'lat'), crs=st_crs(proj.ll))
+
+colon <- st_as_sf(cave.loc[2,], coords=c('long', 'lat'), crs=st_crs(proj.ll))
+
+mainland <- st_as_sf(st_cast(coastline, 'POLYGON'))
+mainland$area <- st_area(mainland)
+colon <- mainland[which(st_contains(mainland, colon, sparse=F)[,1]),]
+mainland <- mainland[which.max(mainland$area),]
+
+foraging$mainland <- st_within(p, mainland, sparse=F)[,1]
+foraging$colon <- st_within(p, colon, sparse=F)[,1]
+foraging$location <- ifelse(foraging$mainland, 'mainland',
+                            ifelse(foraging$colon, 'isla colon', 'elsewhere'))
+
+```
+
+## Save simulated + observed foraging locations to file
+
+```{r}
+#| eval: false
+
+save(foraging, file='data/240502_foraging_all.RData')
+
+```
+
+**Note:** This file will be used as basis for the GLMMs which are detailed in Appendix X.
+
+
