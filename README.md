@@ -1,7 +1,7 @@
 
 ### Consistent long-distance foraging flights across years and seasons at colony level in a Neotropical bat
 
-The code presents the analysis workflow to test how Phyllostomus hastatus show consistent foraging flights across years and colonies. The code requires personal log in information of movebank and stadia maps.
+The code presents the analysis workflow to test how Phyllostomus hastatus shows consistent foraging flights across years and colonies. The code requires personal login information for movebank and stadia maps.
 
 The code follows as:
 
@@ -19,7 +19,7 @@ The code follows as:
 
 Additionally this repository contains the appendixes of the stan models and the simulations used in this paper.
 
-Colonies have been renamed as colony 1, 2 and 3. Original names are
+Colonies have been renamed in the code and in the manuscript as colonies 1, 2, and 3. Original names during the capturing/tagging process are:
 - La Gruta = colony 1
 - Aj cave = colony 2
 - Muddy cave= colony 3
