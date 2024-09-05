@@ -5,7 +5,7 @@ The code presents the analysis workflow to test how Phyllostomus hastatus show c
 
 The code follows as:
 
-1. 1.CleaningData_Bocas2021-2022_gh
+1. CleaningData_Bocas2021-2022_gh
 2. CleaningData_2023_gh
 3. CleaningData_2016_gh
 4. Merge_alldata
