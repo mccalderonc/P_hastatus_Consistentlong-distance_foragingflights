@@ -1,7 +1,11 @@
 
 ### Consistent long-distance foraging flights across years and seasons at colony level in a Neotropical bat
 
-The code presents the analysis workflow to test how Phyllostomus hastatus shows consistent foraging flights across years and colonies. The code requires personal login information for movebank and stadia maps.
+This repository presents the analysis workflow to test how Phyllostomus hastatus shows consistent foraging flights across years and colonies. The code requires personal login information for movebank and stadia maps.
+
+This code is part of the following publication: 
+Calderón-Capote MC, van ToorML, O’Mara MT, Bayer TD, Crofoot MC, DechmannDKN. 2024 Consistent long-distance foragingflights across years and seasons at colony level ina neotropical bat. Biol. Lett. 20: 20240424. doi: https://doi.org/10.1098/rsbl.2024.0424
+
 
 The code follows as:
 
